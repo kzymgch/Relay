@@ -147,64 +147,200 @@ describe("SettingsPanel", () => {
     });
   });
 
-  it("Theme mode dropdown writes through to config_save", async () => {
+  it("Theme preset dropdown writes through to config_save", async () => {
     captureWith();
     const config = createConfigStore();
     const { container } = render(SettingsPanel, {
       props: { open: true, config, onclose: vi.fn() },
     });
     const select = container.querySelector(
-      '[data-testid="settings-theme-mode"]'
+      '[data-testid="settings-theme-preset"]'
     ) as HTMLSelectElement;
     expect(select.value).toBe("dark");
-    select.value = "light";
+    select.value = "solarized-dark";
     await fireEvent.change(select);
     await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
     await vi.waitFor(() => {
       const save = calls.find((c) => c.cmd === "config_save");
       expect(save).toBeDefined();
-      expect((save!.args.config as { theme: { mode: string } }).theme.mode).toBe("light");
+      expect((save!.args.config as { theme: { preset: string } }).theme.preset).toBe(
+        "solarized-dark"
+      );
     });
   });
 
-  it("Keybind editor adds, edits, and removes entries that round-trip to the wire map", async () => {
+  it("Selecting Custom preset reveals the colour pickers and round-trips through save", async () => {
     captureWith();
     const config = createConfigStore();
     const { container } = render(SettingsPanel, {
       props: { open: true, config, onclose: vi.fn() },
     });
-    // Add two rows.
-    const addBtn = container.querySelector('[data-testid="settings-keybind-add"]') as HTMLElement;
-    await fireEvent.click(addBtn);
-    await fireEvent.click(addBtn);
-    // Fill them in.
-    const action0 = container.querySelector(
-      '[data-testid="settings-keybind-action-0"]'
+    const select = container.querySelector(
+      '[data-testid="settings-theme-preset"]'
+    ) as HTMLSelectElement;
+    select.value = "custom";
+    await fireEvent.change(select);
+    const customBlock = container.querySelector(
+      '[data-testid="settings-theme-custom"]'
+    ) as HTMLElement;
+    expect(customBlock).toBeTruthy();
+    const bgInput = container.querySelector(
+      '[data-testid="settings-theme-xterm-background"]'
     ) as HTMLInputElement;
-    const combo0 = container.querySelector(
-      '[data-testid="settings-keybind-combo-0"]'
-    ) as HTMLInputElement;
-    const action1 = container.querySelector(
-      '[data-testid="settings-keybind-action-1"]'
-    ) as HTMLInputElement;
-    const combo1 = container.querySelector(
-      '[data-testid="settings-keybind-combo-1"]'
-    ) as HTMLInputElement;
-    await fireEvent.input(action0, { target: { value: "palette.open" } });
-    await fireEvent.input(combo0, { target: { value: "cmd+p" } });
-    await fireEvent.input(action1, { target: { value: "settings.open" } });
-    await fireEvent.input(combo1, { target: { value: "cmd+," } });
-    // Remove the first one.
-    await fireEvent.click(
-      container.querySelector('[data-testid="settings-keybind-remove-0"]') as HTMLElement
+    await fireEvent.input(bgInput, { target: { value: "#112233" } });
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const cfg = save!.args.config as {
+        theme: { preset: string; custom: { xterm: Record<string, string> } | null };
+      };
+      expect(cfg.theme.preset).toBe("custom");
+      expect(cfg.theme.custom?.xterm.background).toBe("#112233");
+    });
+  });
+
+  it("Keybind row records a fresh combo and persists it as an override", async () => {
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    const recordBtn = container.querySelector(
+      '[data-testid="settings-keybind-record-palette.open"]'
+    ) as HTMLElement;
+    await fireEvent.click(recordBtn);
+    // Simulate the user pressing Cmd+Shift+P.
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyP", metaKey: true, shiftKey: true })
     );
     await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
     await vi.waitFor(() => {
       const save = calls.find((c) => c.cmd === "config_save");
       expect(save).toBeDefined();
       const map = (save!.args.config as { keybind: Record<string, string> }).keybind;
-      // Only the kept (originally index 1) binding survives.
-      expect(map).toEqual({ "settings.open": "cmd+," });
+      expect(map["palette.open"]).toBe("cmd+shift+p");
+    });
+  });
+
+  it("Clicking Record on a second row cancels the first arm (only one row gets the next keypress)", async () => {
+    // Regression: each Record click used to append a listener and only
+    // remove it on commit, so re-arming a different row caused both
+    // listeners to fire on the next keystroke and commit the same combo
+    // to two unrelated actions.
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-keybind-record-palette.open"]') as HTMLElement
+    );
+    await fireEvent.click(
+      container.querySelector(
+        '[data-testid="settings-keybind-record-settings.open"]'
+      ) as HTMLElement
+    );
+    // Press a fresh combo. Only the second arm (settings.open) should
+    // commit it; palette.open keeps its default.
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "F9" }));
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const map = (save!.args.config as { keybind: Record<string, string> }).keybind;
+      expect(map["settings.open"]).toBe("f9");
+      expect(map["palette.open"]).toBeUndefined();
+    });
+  });
+
+  it("Closing the panel cancels a pending Record arm (no stray combo after re-open)", async () => {
+    // Without the modal-close teardown, a Record arm survived a Cancel
+    // click and the very next keystroke (e.g. typing into the terminal)
+    // would silently commit to the previously-armed action.
+    captureWith();
+    const config = createConfigStore();
+    let onclose = vi.fn();
+    const { container, rerender } = render(SettingsPanel, {
+      props: { open: true, config, onclose },
+    });
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-keybind-record-palette.open"]') as HTMLElement
+    );
+    // Close the modal — the recording listener must tear down.
+    await rerender({ open: false, config, onclose });
+    // Press a key. If the listener were still attached, it would write
+    // "f9" into palette.open on the (now hidden) draft.
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "F9" }));
+
+    // Re-open the modal and Save without further edits. The override map
+    // should be empty.
+    onclose = vi.fn();
+    await rerender({ open: true, config, onclose });
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const map = (save!.args.config as { keybind: Record<string, string> }).keybind;
+      expect(map).toEqual({});
+    });
+  });
+
+  it("Saving Custom preset without any picker edits emits an empty payload (passes Rust validation)", async () => {
+    // Regression: buildCustomPayload used to return null when the
+    // customColours map was empty, but Rust validation requires
+    // theme.custom to be Some whenever theme.preset is "custom". The
+    // settings UI looked valid but every save failed.
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    const select = container.querySelector(
+      '[data-testid="settings-theme-preset"]'
+    ) as HTMLSelectElement;
+    select.value = "custom";
+    await fireEvent.change(select);
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const theme = (
+        save!.args.config as {
+          theme: {
+            preset: string;
+            custom: { xterm: Record<string, string>; chrome: Record<string, string> } | null;
+          };
+        }
+      ).theme;
+      expect(theme.preset).toBe("custom");
+      expect(theme.custom).not.toBeNull();
+      expect(theme.custom).toEqual({ xterm: {}, chrome: {} });
+    });
+  });
+
+  it("Reset clears a recorded override so save emits no entry for it", async () => {
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    // Record then reset.
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-keybind-record-palette.open"]') as HTMLElement
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyP", metaKey: true, shiftKey: true })
+    );
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-keybind-reset-palette.open"]') as HTMLElement
+    );
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const map = (save!.args.config as { keybind: Record<string, string> }).keybind;
+      expect(map["palette.open"]).toBeUndefined();
     });
   });
 

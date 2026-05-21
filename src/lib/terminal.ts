@@ -41,6 +41,12 @@ export interface TerminalProps {
    * property of xterm.js's resize, not a bug here.
    */
   scrollback?: number;
+  /** Pane id stamped on the DataTransfer payload by the SelectionChip so
+   *  drop targets can reject same-source drops. The chip is suppressed when
+   *  `paneId` is absent (used in unit tests that mount Terminal directly). */
+  paneId?: string;
+  /** Human label for the source pane, surfaced in the send preview modal. */
+  sourceLabel?: string;
   ondata?: (data: string) => void;
   onresize?: (cols: number, rows: number) => void;
   onready?: (api: TerminalApi) => void;

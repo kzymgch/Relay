@@ -1,0 +1,298 @@
+// Built-in themes. Each carries the full xterm 16-colour ANSI palette plus
+// a chrome palette so swapping a preset re-skins both the terminal canvas
+// and every surrounding panel in one go.
+
+import type { ITheme } from "@xterm/xterm";
+
+import type { ChromePalette } from "./chrome";
+
+export type ThemeId = "dark" | "light" | "solarized-dark" | "solarized-light" | "dracula";
+
+/** What can legitimately appear in `ThemeDef.id` — every builtin plus the
+ *  `"custom"` sentinel produced by the resolver for user-defined themes. */
+export type ResolvedThemeId = ThemeId | "custom";
+
+export interface ThemeDef {
+  id: ResolvedThemeId;
+  label: string;
+  xterm: ITheme;
+  chrome: ChromePalette;
+}
+
+const DARK: ThemeDef = {
+  id: "dark",
+  label: "Dark",
+  xterm: {
+    background: "#1f2125",
+    foreground: "#f5f5f5",
+    cursor: "#f5f5f5",
+    cursorAccent: "#1f2125",
+    selectionBackground: "rgba(255, 255, 255, 0.2)",
+    black: "#1f2125",
+    red: "#ff6b6b",
+    green: "#4ade80",
+    yellow: "#fbbf24",
+    blue: "#60a5fa",
+    magenta: "#c084fc",
+    cyan: "#67e8f9",
+    white: "#d4d4d4",
+    brightBlack: "#6b7280",
+    brightRed: "#fca5a5",
+    brightGreen: "#86efac",
+    brightYellow: "#fde68a",
+    brightBlue: "#93c5fd",
+    brightMagenta: "#d8b4fe",
+    brightCyan: "#a5f3fc",
+    brightWhite: "#f5f5f5",
+  },
+  chrome: {
+    appBg: "#000000",
+    toolbarBg: "#1a1a1a",
+    toolbarBorder: "#2a2a2a",
+    toolbarFg: "#d4d4d4",
+    paneBg: "#1e1e1e",
+    paneBorder: "#2a2a2a",
+    paneBorderFocused: "#4c8df6",
+    paneHeaderBg: "#2a2a2a",
+    paneHeaderFg: "#d4d4d4",
+    dropHighlight: "rgba(76, 141, 246, 0.25)",
+    statusRunning: "#4ade80",
+    statusSpawning: "#fbbf24",
+    statusExited: "#94a3b8",
+    statusError: "#f87171",
+    modalBackdrop: "rgba(0, 0, 0, 0.55)",
+    modalBg: "#1e1e1e",
+    modalFg: "#f5f5f5",
+    paletteBg: "#1e1e1e",
+    paletteHighlight: "#2a3a55",
+    statusBarBg: "#1a1a1a",
+    statusBarFg: "#d4d4d4",
+  },
+};
+
+const LIGHT: ThemeDef = {
+  id: "light",
+  label: "Light",
+  xterm: {
+    background: "#ffffff",
+    foreground: "#1a1a1a",
+    cursor: "#1a1a1a",
+    cursorAccent: "#ffffff",
+    selectionBackground: "rgba(0, 0, 0, 0.15)",
+    black: "#1a1a1a",
+    red: "#c0392b",
+    green: "#27ae60",
+    yellow: "#d35400",
+    blue: "#2980b9",
+    magenta: "#8e44ad",
+    cyan: "#16a085",
+    white: "#3c3c3c",
+    brightBlack: "#7f8c8d",
+    brightRed: "#e74c3c",
+    brightGreen: "#2ecc71",
+    brightYellow: "#f39c12",
+    brightBlue: "#3498db",
+    brightMagenta: "#9b59b6",
+    brightCyan: "#1abc9c",
+    brightWhite: "#1a1a1a",
+  },
+  chrome: {
+    appBg: "#f5f5f5",
+    toolbarBg: "#ffffff",
+    toolbarBorder: "#d9d9d9",
+    toolbarFg: "#1a1a1a",
+    paneBg: "#ffffff",
+    paneBorder: "#d9d9d9",
+    paneBorderFocused: "#1f6fdb",
+    paneHeaderBg: "#eef0f3",
+    paneHeaderFg: "#1a1a1a",
+    dropHighlight: "rgba(31, 111, 219, 0.18)",
+    statusRunning: "#16a34a",
+    statusSpawning: "#d97706",
+    statusExited: "#64748b",
+    statusError: "#dc2626",
+    modalBackdrop: "rgba(0, 0, 0, 0.3)",
+    modalBg: "#ffffff",
+    modalFg: "#1a1a1a",
+    paletteBg: "#ffffff",
+    paletteHighlight: "#dbe7fb",
+    statusBarBg: "#ffffff",
+    statusBarFg: "#1a1a1a",
+  },
+};
+
+const SOLARIZED_DARK: ThemeDef = {
+  id: "solarized-dark",
+  label: "Solarized Dark",
+  xterm: {
+    background: "#002b36",
+    foreground: "#839496",
+    cursor: "#93a1a1",
+    cursorAccent: "#002b36",
+    selectionBackground: "rgba(147, 161, 161, 0.2)",
+    black: "#073642",
+    red: "#dc322f",
+    green: "#859900",
+    yellow: "#b58900",
+    blue: "#268bd2",
+    magenta: "#d33682",
+    cyan: "#2aa198",
+    white: "#eee8d5",
+    brightBlack: "#586e75",
+    brightRed: "#cb4b16",
+    brightGreen: "#586e75",
+    brightYellow: "#657b83",
+    brightBlue: "#839496",
+    brightMagenta: "#6c71c4",
+    brightCyan: "#93a1a1",
+    brightWhite: "#fdf6e3",
+  },
+  chrome: {
+    appBg: "#002b36",
+    toolbarBg: "#073642",
+    toolbarBorder: "#0a3d4a",
+    toolbarFg: "#93a1a1",
+    paneBg: "#073642",
+    paneBorder: "#0a3d4a",
+    paneBorderFocused: "#268bd2",
+    paneHeaderBg: "#0a3d4a",
+    paneHeaderFg: "#93a1a1",
+    dropHighlight: "rgba(38, 139, 210, 0.28)",
+    statusRunning: "#859900",
+    statusSpawning: "#b58900",
+    statusExited: "#586e75",
+    statusError: "#dc322f",
+    modalBackdrop: "rgba(0, 0, 0, 0.55)",
+    modalBg: "#073642",
+    modalFg: "#eee8d5",
+    paletteBg: "#073642",
+    paletteHighlight: "#0e4756",
+    statusBarBg: "#073642",
+    statusBarFg: "#93a1a1",
+  },
+};
+
+const SOLARIZED_LIGHT: ThemeDef = {
+  id: "solarized-light",
+  label: "Solarized Light",
+  xterm: {
+    background: "#fdf6e3",
+    foreground: "#657b83",
+    cursor: "#586e75",
+    cursorAccent: "#fdf6e3",
+    selectionBackground: "rgba(88, 110, 117, 0.2)",
+    black: "#073642",
+    red: "#dc322f",
+    green: "#859900",
+    yellow: "#b58900",
+    blue: "#268bd2",
+    magenta: "#d33682",
+    cyan: "#2aa198",
+    white: "#eee8d5",
+    brightBlack: "#002b36",
+    brightRed: "#cb4b16",
+    brightGreen: "#586e75",
+    brightYellow: "#657b83",
+    brightBlue: "#839496",
+    brightMagenta: "#6c71c4",
+    brightCyan: "#93a1a1",
+    brightWhite: "#fdf6e3",
+  },
+  chrome: {
+    appBg: "#fdf6e3",
+    toolbarBg: "#eee8d5",
+    toolbarBorder: "#d9d2bf",
+    toolbarFg: "#657b83",
+    paneBg: "#fdf6e3",
+    paneBorder: "#d9d2bf",
+    paneBorderFocused: "#268bd2",
+    paneHeaderBg: "#eee8d5",
+    paneHeaderFg: "#657b83",
+    dropHighlight: "rgba(38, 139, 210, 0.18)",
+    statusRunning: "#859900",
+    statusSpawning: "#b58900",
+    statusExited: "#93a1a1",
+    statusError: "#dc322f",
+    modalBackdrop: "rgba(0, 43, 54, 0.3)",
+    modalBg: "#fdf6e3",
+    modalFg: "#073642",
+    paletteBg: "#fdf6e3",
+    paletteHighlight: "#e4dfca",
+    statusBarBg: "#eee8d5",
+    statusBarFg: "#657b83",
+  },
+};
+
+const DRACULA: ThemeDef = {
+  id: "dracula",
+  label: "Dracula",
+  xterm: {
+    background: "#282a36",
+    foreground: "#f8f8f2",
+    cursor: "#f8f8f2",
+    cursorAccent: "#282a36",
+    selectionBackground: "rgba(68, 71, 90, 0.6)",
+    black: "#21222c",
+    red: "#ff5555",
+    green: "#50fa7b",
+    yellow: "#f1fa8c",
+    blue: "#bd93f9",
+    magenta: "#ff79c6",
+    cyan: "#8be9fd",
+    white: "#f8f8f2",
+    brightBlack: "#6272a4",
+    brightRed: "#ff6e6e",
+    brightGreen: "#69ff94",
+    brightYellow: "#ffffa5",
+    brightBlue: "#d6acff",
+    brightMagenta: "#ff92df",
+    brightCyan: "#a4ffff",
+    brightWhite: "#ffffff",
+  },
+  chrome: {
+    appBg: "#1e1f29",
+    toolbarBg: "#282a36",
+    toolbarBorder: "#383a4a",
+    toolbarFg: "#f8f8f2",
+    paneBg: "#282a36",
+    paneBorder: "#383a4a",
+    paneBorderFocused: "#bd93f9",
+    paneHeaderBg: "#383a4a",
+    paneHeaderFg: "#f8f8f2",
+    dropHighlight: "rgba(189, 147, 249, 0.28)",
+    statusRunning: "#50fa7b",
+    statusSpawning: "#f1fa8c",
+    statusExited: "#6272a4",
+    statusError: "#ff5555",
+    modalBackdrop: "rgba(0, 0, 0, 0.55)",
+    modalBg: "#282a36",
+    modalFg: "#f8f8f2",
+    paletteBg: "#282a36",
+    paletteHighlight: "#44475a",
+    statusBarBg: "#282a36",
+    statusBarFg: "#f8f8f2",
+  },
+};
+
+export const BUILTIN_THEMES: Record<ThemeId, ThemeDef> = {
+  dark: DARK,
+  light: LIGHT,
+  "solarized-dark": SOLARIZED_DARK,
+  "solarized-light": SOLARIZED_LIGHT,
+  dracula: DRACULA,
+};
+
+export const BUILTIN_THEME_IDS: readonly ThemeId[] = [
+  "dark",
+  "light",
+  "solarized-dark",
+  "solarized-light",
+  "dracula",
+];
+
+/** Theme used when no preset matches and no usable custom override exists. */
+export const FALLBACK_THEME: ThemeDef = DARK;
+
+export function isBuiltinThemeId(value: string): value is ThemeId {
+  return (BUILTIN_THEME_IDS as readonly string[]).includes(value);
+}

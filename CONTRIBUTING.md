@@ -42,13 +42,13 @@ Every PR must pass the following locally and in CI.
 
 ### Frontend
 
-| Command                    | Purpose                                           |
-| -------------------------- | ------------------------------------------------- |
-| `pnpm lint`                | ESLint (typescript-eslint + eslint-plugin-svelte) |
-| `pnpm format:check`        | Prettier (`prettier-plugin-svelte`)               |
-| `pnpm typecheck`           | `svelte-kit sync` + `svelte-check`                |
-| `pnpm test`                | Vitest (unit)                                     |
-| `pnpm e2e` (PR-30 onwards) | Playwright browser smoke                          |
+| Command             | Purpose                                           |
+| ------------------- | ------------------------------------------------- |
+| `pnpm lint`         | ESLint (typescript-eslint + eslint-plugin-svelte) |
+| `pnpm format:check` | Prettier (`prettier-plugin-svelte`)               |
+| `pnpm typecheck`    | `svelte-kit sync` + `svelte-check`                |
+| `pnpm test`         | Vitest (unit)                                     |
+| `pnpm e2e`          | Playwright browser smoke                          |
 
 ### Rust (`src-tauri/`)
 
@@ -85,7 +85,8 @@ A PR is ready to merge when:
       (Rust unit/integration test, Vitest, or Playwright browser smoke)
 - [ ] `pnpm lint && pnpm format:check && pnpm typecheck && pnpm test` is green
 - [ ] `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all` is green
-- [ ] For PR-30 and later: `pnpm e2e` is green
+- [ ] `pnpm e2e` is green
+- [ ] Before tagging a release, walk through `scripts/manual-smoke.md`
 - [ ] CI is green on the PR
 - [ ] PR description includes test plan and (if relevant) a screenshot / recording
 
@@ -99,7 +100,7 @@ A PR is ready to merge when:
 - **Frontend unit tests** — Vitest. Svelte components via
   `@testing-library/svelte`. Tauri APIs stubbed via
   `@tauri-apps/api/mocks` (`mockIPC`).
-- **Frontend browser smoke** — Playwright (browser mode), introduced in PR-30.
+- **Frontend browser smoke** — Playwright (browser mode).
   Runs against the Vite dev server with `mockIPC`. Covers screen flows,
   keybindings, and IPC contract — **not** real Tauri runtime, PTY, or
   filesystem.

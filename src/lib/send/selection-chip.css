@@ -1,0 +1,39 @@
+.selection-chip {
+  position: absolute;
+  z-index: 6;
+  /* Sized via inline style; defaults below keep the chip visible if the
+   * positioner hasn't run yet. */
+  background: var(--relay-pane-border-focused);
+  color: #ffffff;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font:
+    11px/1.2 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: grab;
+  user-select: none;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  /* macOS-style focus ring isn't useful here; the chip is keyboard-skipped. */
+  outline: none;
+}
+
+.selection-chip:hover {
+  filter: brightness(1.1);
+}
+
+.selection-chip:active {
+  cursor: grabbing;
+}
+
+.selection-chip[hidden] {
+  display: none;
+}

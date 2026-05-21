@@ -15,6 +15,7 @@ class MockTerminal {
   options: Record<string, unknown>;
   addons: unknown[] = [];
   openedOn: HTMLElement | null = null;
+  buffer = { active: { viewportY: 0 } };
 
   constructor(options: Record<string, unknown>) {
     this.options = { ...options };
@@ -38,6 +39,31 @@ class MockTerminal {
   // empty default matches xterm's real "no selection" return value.
   selection = "";
   getSelection = vi.fn(() => this.selection);
+  // Optional selection range used by SelectionChip's positioner. Tests that
+  // don't care about positioning can leave this `undefined`.
+  selectionRange: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined =
+    undefined;
+  getSelectionPosition = vi.fn(() => this.selectionRange);
+
+  onSelectionChange = vi.fn((cb: () => void) => {
+    state.selectionHandlers.push(cb);
+    return {
+      dispose: vi.fn(() => {
+        const i = state.selectionHandlers.indexOf(cb);
+        if (i >= 0) state.selectionHandlers.splice(i, 1);
+      }),
+    };
+  });
+
+  onScroll = vi.fn((cb: () => void) => {
+    state.scrollHandlers.push(cb);
+    return {
+      dispose: vi.fn(() => {
+        const i = state.scrollHandlers.indexOf(cb);
+        if (i >= 0) state.scrollHandlers.splice(i, 1);
+      }),
+    };
+  });
 
   paste = vi.fn((data: string) => {
     for (const cb of state.dataHandlers) cb(data);
@@ -84,12 +110,16 @@ interface State {
   instances: MockTerminal[];
   dataHandlers: OnDataCallback[];
   resizeHandlers: OnResizeCallback[];
+  selectionHandlers: Array<() => void>;
+  scrollHandlers: Array<() => void>;
 }
 
 const state: State = {
   instances: [],
   dataHandlers: [],
   resizeHandlers: [],
+  selectionHandlers: [],
+  scrollHandlers: [],
 };
 
 export { MockTerminal, MockFitAddon, MockWebLinksAddon, MockSearchAddon, MockSerializeAddon };
@@ -98,6 +128,8 @@ export function resetXtermMocks(): void {
   state.instances.length = 0;
   state.dataHandlers.length = 0;
   state.resizeHandlers.length = 0;
+  state.selectionHandlers.length = 0;
+  state.scrollHandlers.length = 0;
 }
 
 export function getXtermState(): State {

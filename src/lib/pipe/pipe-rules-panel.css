@@ -3,7 +3,7 @@
   justify-content: space-between;
   align-items: center;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--relay-toolbar-border);
 }
 
 .pipe-rules-body {
@@ -24,12 +24,12 @@
 .pipe-rules-table td {
   text-align: left;
   padding: 6px 8px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--relay-toolbar-border);
   vertical-align: middle;
 }
 
 .pipe-rules-table th {
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--relay-status-exited);
   font-weight: 500;
 }
 
@@ -37,13 +37,13 @@
   display: grid;
   grid-template-columns: 110px 1fr;
   gap: 6px 10px;
-  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  border-top: 1px dashed var(--relay-toolbar-border);
   padding-top: 10px;
 }
 
 .pipe-rules-form label {
   align-self: center;
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--relay-toolbar-fg);
 }
 
 .pipe-rules-form input,
@@ -57,24 +57,24 @@
   gap: 8px;
   justify-content: flex-end;
   padding: 8px 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--relay-toolbar-border);
 }
 
 .pipe-rules-toast {
   background: rgba(220, 80, 80, 0.18);
-  border: 1px solid rgba(220, 80, 80, 0.4);
+  border: 1px solid var(--relay-status-error);
   border-radius: 4px;
   padding: 6px 10px;
   font-size: 12px;
-  color: rgba(255, 200, 200, 0.95);
+  color: var(--relay-status-error);
 }
 
 .pipe-rules-empty {
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--relay-status-exited);
   font-style: italic;
   padding: 12px 4px;
 }
 
 .pipe-rules-table td.danger button {
-  color: rgba(220, 80, 80, 0.9);
+  color: var(--relay-status-error);
 }

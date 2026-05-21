@@ -9,9 +9,9 @@
   flex: 0 0 22px;
   font-size: 11px;
   line-height: 22px;
-  background: rgba(0, 0, 0, 0.35);
-  color: rgba(255, 255, 255, 0.78);
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--relay-status-bar-bg);
+  color: var(--relay-status-bar-fg);
+  border-top: 1px solid var(--relay-toolbar-border);
   user-select: none;
 }
 
@@ -22,7 +22,7 @@
 }
 
 .status-bar-item .label {
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--relay-status-exited);
 }
 
 .status-bar-spacer {

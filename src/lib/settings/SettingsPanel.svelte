@@ -6,11 +6,17 @@
     defaultConfig,
     exportConfig,
     importConfig,
+    type CustomThemePayload,
     type PaneSpecConfig,
     type RelayConfig,
   } from "../config";
   import type { ConfigStore } from "../config.svelte";
   import type { SettingsSection } from "../palette/actions";
+  import { BUILTIN_THEMES, BUILTIN_THEME_IDS, type ThemeId } from "../theme/presets";
+  import { KEYBIND_ACTIONS, defaultKeybindMap } from "../keybind/actions";
+  import { comboFromEvent, formatCombo, parseCombo } from "../keybind/combo";
+  import { resolveKeybinds } from "../keybind/resolve";
+  import { detectConflicts } from "../keybind/conflicts";
 
   import "./settings-panel.css";
 
@@ -36,17 +42,27 @@
   // keystroke (which would fight the user's cursor in the textarea).
   let defaultPaneArgsRaw: string = $state("");
   let presetArgsRaw: string[] = $state([]);
-  // Keybind is stored on the wire as `Record<action.id, combo>`. The form
-  // edits a parallel `Array<{action, combo}>` because object keys can't
-  // be reactively bound to inputs (renaming a key would lose the input
-  // focus on every keystroke).
-  let keybindRows: { action: string; combo: string }[] = $state([]);
+  // Per-action combo state — one entry per `KEYBIND_ACTIONS` row. Initial
+  // values are populated from `config.keybind`, falling back to the default
+  // combo when the user hasn't overridden it.
+  let keybindCombos: Record<string, string> = $state({});
+  let recordingAction: string | null = $state(null);
+  // Slot ids → "#rrggbb" for the customisable colour pickers. Mirrors
+  // `draft.theme.custom` but in a flat shape that's easier to bind to
+  // <input type="color">.
+  let customColours: Record<string, string> = $state({});
   let importPath: string = $state("");
   let exportPath: string = $state("");
   let lastStatus: string = $state("");
 
   $effect(() => {
-    if (!open) return;
+    if (!open) {
+      // Closing the panel must also disarm any pending Record listener —
+      // otherwise the next keystroke in the underlying terminal would
+      // commit a stray combo to the action that was being recorded.
+      cancelRecording?.();
+      return;
+    }
     // Read all derived values from a local, non-reactive snapshot so the
     // subsequent writes to `draft` / `defaultPaneArgsRaw` / `presetArgsRaw`
     // don't create a read-after-write loop in this effect.
@@ -55,7 +71,8 @@
     draft = snap;
     defaultPaneArgsRaw = snap.defaultPane.args.join(" ");
     presetArgsRaw = snap.pane.preset.map((p) => p.args.join(" "));
-    keybindRows = Object.entries(snap.keybind).map(([action, combo]) => ({ action, combo }));
+    keybindCombos = seedKeybindCombos(snap.keybind);
+    customColours = seedCustomColours(snap.theme.custom);
     lastStatus = "";
     if (initialSection) {
       void tick().then(() => scrollToSection(initialSection));
@@ -94,25 +111,155 @@
     presetArgsRaw = presetArgsRaw.filter((_, i) => i !== idx);
   }
 
-  function addKeybind(): void {
-    keybindRows = [...keybindRows, { action: "", combo: "" }];
-  }
-
-  function removeKeybind(idx: number): void {
-    keybindRows = keybindRows.filter((_, i) => i !== idx);
-  }
-
-  /** Collapse the form rows into the `Record<action, combo>` shape. The
-   * last row wins when duplicate action keys exist; empty actions are
-   * dropped. */
-  function keybindMap(): Record<string, string> {
+  function seedKeybindCombos(userMap: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
-    for (const { action, combo } of keybindRows) {
-      const a = action.trim();
-      if (!a) continue;
-      out[a] = combo.trim();
+    for (const action of KEYBIND_ACTIONS) {
+      const override = userMap[action.id];
+      out[action.id] = override ?? action.defaultCombo;
     }
     return out;
+  }
+
+  /** Strip rows whose combo equals the default — those don't need to land in
+   *  config.keybind, and skipping them keeps the on-disk diff minimal when
+   *  the user only tweaked one or two bindings. */
+  function keybindOverridesForSave(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const action of KEYBIND_ACTIONS) {
+      const cur = keybindCombos[action.id] ?? action.defaultCombo;
+      if (cur !== action.defaultCombo) {
+        out[action.id] = cur;
+      }
+    }
+    return out;
+  }
+
+  /** Cleanup hook for the currently-armed recording listener. `null` when
+   *  no Record button is waiting for input. Held in module scope so a
+   *  second Record click can tear down the previous arm, and so closing
+   *  the modal (the $effect below) doesn't leak a dangling listener. */
+  let cancelRecording: (() => void) | null = null;
+
+  /** Begin recording: the next non-modifier keydown over the row commits a
+   *  fresh combo. The handler attaches a one-shot window listener so the
+   *  capture works no matter which element happens to be focused. Clicking
+   *  Record on a second row first cancels the previous arm — otherwise the
+   *  next keypress would commit to both rows. */
+  function startRecording(actionId: string): void {
+    cancelRecording?.();
+    recordingAction = actionId;
+    const listener = (event: KeyboardEvent) => {
+      const combo = comboFromEvent(event);
+      if (!combo) return; // ignore lone modifier presses
+      event.preventDefault();
+      event.stopPropagation();
+      keybindCombos = { ...keybindCombos, [actionId]: formatCombo(combo) };
+      teardown();
+    };
+    const teardown = (): void => {
+      window.removeEventListener("keydown", listener, true);
+      cancelRecording = null;
+      recordingAction = null;
+    };
+    cancelRecording = teardown;
+    window.addEventListener("keydown", listener, true);
+  }
+
+  function resetKeybind(actionId: string): void {
+    const def = KEYBIND_ACTIONS.find((a) => a.id === actionId);
+    if (!def) return;
+    cancelRecording?.();
+    keybindCombos = { ...keybindCombos, [actionId]: def.defaultCombo };
+  }
+
+  function resetAllKeybinds(): void {
+    cancelRecording?.();
+    keybindCombos = defaultKeybindMap();
+  }
+
+  function seedCustomColours(
+    custom: CustomThemePayload | null | undefined
+  ): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (custom) {
+      for (const [slot, value] of Object.entries(custom.xterm ?? {})) {
+        out[`xterm.${slot}`] = value;
+      }
+      for (const [slot, value] of Object.entries(custom.chrome ?? {})) {
+        out[`chrome.${slot}`] = value;
+      }
+    }
+    return out;
+  }
+
+  /** Convert the flat `customColours` map back into the structured payload
+   *  required by `ThemeConfig.custom`. Only emits slots the user touched.
+   *
+   *  Always returns an object (possibly empty) because Rust validation
+   *  requires `theme.custom` to be `Some` when `theme.preset == "custom"`.
+   *  An empty payload means "fall back to FALLBACK_THEME everywhere",
+   *  which the resolver already handles. */
+  function buildCustomPayload(): CustomThemePayload {
+    const xterm: Record<string, string> = {};
+    const chrome: Record<string, string> = {};
+    for (const [key, value] of Object.entries(customColours)) {
+      if (!value) continue;
+      if (key.startsWith("xterm.")) {
+        xterm[key.slice("xterm.".length)] = value;
+      } else if (key.startsWith("chrome.")) {
+        chrome[key.slice("chrome.".length)] = value;
+      }
+    }
+    return { xterm, chrome };
+  }
+
+  /** Customisable slots surfaced in the GUI. Keep the list short: the modal
+   *  is already busy and the long tail (16 ANSI variants × chrome) is better
+   *  edited by hand in config.toml. */
+  const CUSTOM_XTERM_SLOTS: readonly { key: string; label: string }[] = [
+    { key: "background", label: "Terminal background" },
+    { key: "foreground", label: "Terminal foreground" },
+    { key: "cursor", label: "Cursor" },
+    { key: "selectionBackground", label: "Selection" },
+  ];
+  const CUSTOM_CHROME_SLOTS: readonly { key: string; label: string }[] = [
+    { key: "appBg", label: "App background" },
+    { key: "toolbarBg", label: "Toolbar" },
+    { key: "paneBorderFocused", label: "Focused pane border" },
+    { key: "modalBg", label: "Modal background" },
+  ];
+
+  /** Conflict report computed against the form's current combo selection.
+   *  Shown as a red banner inside the keybind section. */
+  const keybindConflicts = $derived.by(() => {
+    const overrides: Record<string, string> = {};
+    for (const action of KEYBIND_ACTIONS) {
+      const cur = keybindCombos[action.id];
+      if (cur && cur !== action.defaultCombo) overrides[action.id] = cur;
+    }
+    return detectConflicts(resolveKeybinds(overrides));
+  });
+
+  function comboDisplay(actionId: string): string {
+    const cur = keybindCombos[actionId];
+    if (!cur) return "";
+    const parsed = parseCombo(cur);
+    return parsed ? formatCombo(parsed) : cur;
+  }
+
+  function isInvalidCombo(actionId: string): boolean {
+    const cur = keybindCombos[actionId];
+    if (!cur) return false;
+    return parseCombo(cur) === null;
+  }
+
+  function actionLabel(actionId: string): string {
+    return KEYBIND_ACTIONS.find((a) => a.id === actionId)?.label ?? actionId;
+  }
+
+  function presetLabel(id: string): string {
+    if (id === "custom") return "Custom";
+    return BUILTIN_THEMES[id as ThemeId]?.label ?? id;
   }
 
   async function save(): Promise<void> {
@@ -125,7 +272,8 @@
         ...p,
         args: parseSpaceArgs(presetArgsRaw[i] ?? ""),
       }));
-      draft.keybind = keybindMap();
+      draft.keybind = keybindOverridesForSave();
+      draft.theme.custom = draft.theme.preset === "custom" ? buildCustomPayload() : null;
       await config.set(draft);
       lastStatus = "Saved.";
     } catch (e) {
@@ -165,7 +313,8 @@
       // values and silently overwrite what was just imported.
       defaultPaneArgsRaw = next.defaultPane.args.join(" ");
       presetArgsRaw = next.pane.preset.map((p) => p.args.join(" "));
-      keybindRows = Object.entries(next.keybind).map(([action, combo]) => ({ action, combo }));
+      keybindCombos = seedKeybindCombos(next.keybind);
+      customColours = seedCustomColours(next.theme.custom);
       lastStatus = `Imported from ${path}`;
     } catch (e) {
       lastStatus = `Import failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -214,6 +363,13 @@
         type="checkbox"
         bind:checked={draft.send.trailingNewline}
         data-testid="settings-send-newline"
+      />
+      <label for="settings-send-preview">Preview before send</label>
+      <input
+        id="settings-send-preview"
+        type="checkbox"
+        bind:checked={draft.send.previewBeforeSend}
+        data-testid="settings-send-preview"
       />
     </section>
 
@@ -409,64 +565,111 @@
 
     <section class="settings-section" data-testid="settings-theme">
       <h3>Theme</h3>
-      <label for="settings-theme-mode">Mode</label>
-      <select
-        id="settings-theme-mode"
-        bind:value={draft.theme.mode}
-        data-testid="settings-theme-mode"
-      >
-        <option value="dark">Dark</option>
-        <option value="light">Light</option>
-      </select>
       <label for="settings-theme-preset">Preset</label>
-      <input
+      <select
         id="settings-theme-preset"
-        type="text"
-        placeholder="default"
         bind:value={draft.theme.preset}
         data-testid="settings-theme-preset"
+      >
+        {#each BUILTIN_THEME_IDS as id (id)}
+          <option value={id}>{presetLabel(id)}</option>
+        {/each}
+        <option value="custom">Custom</option>
+      </select>
+      <label for="settings-theme-transparent">Transparent (macOS vibrancy)</label>
+      <input
+        id="settings-theme-transparent"
+        type="checkbox"
+        bind:checked={draft.theme.transparent}
+        data-testid="settings-theme-transparent"
       />
+      {#if draft.theme.preset === "custom"}
+        <div class="settings-theme-custom" data-testid="settings-theme-custom">
+          {#each CUSTOM_XTERM_SLOTS as slot (slot.key)}
+            <label for={`settings-theme-xterm-${slot.key}`}>{slot.label}</label>
+            <input
+              id={`settings-theme-xterm-${slot.key}`}
+              type="color"
+              value={customColours[`xterm.${slot.key}`] ?? "#000000"}
+              oninput={(e) => {
+                const v = (e.currentTarget as HTMLInputElement).value;
+                customColours = { ...customColours, [`xterm.${slot.key}`]: v };
+              }}
+              data-testid={`settings-theme-xterm-${slot.key}`}
+            />
+          {/each}
+          {#each CUSTOM_CHROME_SLOTS as slot (slot.key)}
+            <label for={`settings-theme-chrome-${slot.key}`}>{slot.label}</label>
+            <input
+              id={`settings-theme-chrome-${slot.key}`}
+              type="color"
+              value={customColours[`chrome.${slot.key}`] ?? "#000000"}
+              oninput={(e) => {
+                const v = (e.currentTarget as HTMLInputElement).value;
+                customColours = { ...customColours, [`chrome.${slot.key}`]: v };
+              }}
+              data-testid={`settings-theme-chrome-${slot.key}`}
+            />
+          {/each}
+        </div>
+      {/if}
     </section>
 
     <section class="settings-section settings-keybind" data-testid="settings-keybind">
       <h3>Keybindings</h3>
       <span class="settings-readonly settings-keybind-help">
-        Stored under <code>[keybind]</code> in config.toml. Combos (e.g.
-        <code>cmd+p</code>) round-trip through save / import but are not yet re-dispatched at
-        runtime — that ships with the full keybind system.
+        Click <strong>Record</strong> on a row, then press the combo you want. Press
+        <strong>Reset</strong> to fall back to the default.
       </span>
-      {#each keybindRows as row, idx (idx)}
-        <div class="settings-keybind-row" data-testid={`settings-keybind-row-${idx}`}>
-          <input
-            type="text"
-            placeholder="action.id (e.g. palette.open)"
-            bind:value={row.action}
-            data-testid={`settings-keybind-action-${idx}`}
-          />
-          <input
-            type="text"
-            placeholder="combo (e.g. cmd+p)"
-            bind:value={row.combo}
-            data-testid={`settings-keybind-combo-${idx}`}
-          />
+      {#if keybindConflicts.length > 0}
+        <div class="settings-keybind-conflicts" data-testid="settings-keybind-conflicts">
+          {#each keybindConflicts as conflict (conflict.combo)}
+            <div>
+              <code>{conflict.combo}</code> is bound to multiple actions:
+              {conflict.actionIds.map((id) => actionLabel(id)).join(", ")}
+            </div>
+          {/each}
+        </div>
+      {/if}
+      {#each KEYBIND_ACTIONS as action (action.id)}
+        <div class="settings-keybind-row" data-testid={`settings-keybind-row-${action.id}`}>
+          <span>{action.label}</span>
+          <span
+            class="combo"
+            class:empty={!keybindCombos[action.id]}
+            class:recording={recordingAction === action.id}
+            class:invalid={isInvalidCombo(action.id)}
+            data-testid={`settings-keybind-combo-${action.id}`}
+          >
+            {#if recordingAction === action.id}
+              press a key…
+            {:else}
+              {comboDisplay(action.id) || action.defaultCombo}
+            {/if}
+          </span>
           <button
             type="button"
-            class="settings-preset-remove"
-            onclick={() => removeKeybind(idx)}
-            data-testid={`settings-keybind-remove-${idx}`}
-            aria-label="Remove keybinding"
+            onclick={() => startRecording(action.id)}
+            data-testid={`settings-keybind-record-${action.id}`}
           >
-            ×
+            Record
+          </button>
+          <button
+            type="button"
+            onclick={() => resetKeybind(action.id)}
+            data-testid={`settings-keybind-reset-${action.id}`}
+          >
+            Reset
           </button>
         </div>
       {/each}
       <button
         type="button"
-        class="settings-preset-add"
-        onclick={addKeybind}
-        data-testid="settings-keybind-add"
+        class="settings-keybind-reset-all"
+        onclick={resetAllKeybinds}
+        data-testid="settings-keybind-reset-all"
       >
-        + Add binding
+        Reset all to defaults
       </button>
     </section>
 

@@ -15,7 +15,7 @@
 .splitter::before {
   content: "";
   position: absolute;
-  background: #2a2a2a;
+  background: var(--relay-pane-border);
   transition: background-color 80ms ease;
 }
 
@@ -46,9 +46,9 @@
 }
 
 .splitter:hover::before {
-  background: #404040;
+  background: var(--relay-toolbar-border);
 }
 
 .splitter.dragging::before {
-  background: #4c8df6;
+  background: var(--relay-pane-border-focused);
 }

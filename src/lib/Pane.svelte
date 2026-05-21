@@ -138,6 +138,18 @@
      */
     sendTargets?: PaneSendTarget[];
     /**
+     * Stable id of this pane, threaded into the embedded SelectionChip so its
+     * DataTransfer payload carries the source pane id. Drop targets reject
+     * same-source drops by comparing against their own `paneId`.
+     */
+    paneId?: string;
+    /**
+     * Called when a relay DnD payload is released over this pane. The
+     * parent decides whether to open the SendPreviewModal or write
+     * directly to the target PTY based on `config.send.previewBeforeSend`.
+     */
+    onsenddropped?: (info: { sourcePaneId: string; text: string }) => void;
+    /**
      * Called on mount (with a live handle) and on unmount (with `undefined`).
      * Parents use the handle for keybindings (`Cmd+Shift+1..N`) and the
      * command palette without coupling to internal pane state.
@@ -165,10 +177,19 @@
     reorderHint,
     onupdatemeta,
     sendTargets = [],
+    paneId,
+    onsenddropped,
     onregister,
   }: Props = $props();
 
+  /** MIME prefix used by SelectionChip drag sources for same-app DnD. */
+  const SEND_DND_MIME = "application/x-relay-send";
+
   let status: PaneStatus = $state("spawning");
+  let dropActive = $state(false);
+  // ondragenter/leave flicker across child elements; track depth so the
+  // highlight only clears once every nested enter has been matched.
+  let dragDepth = 0;
   let exitInfo: { code: number; success: boolean } | null = $state(null);
   let errorMessage: string | undefined = $state();
   // 1-based once the reconnect supervisor takes over; 0 on the initial
@@ -437,6 +458,54 @@
     }
   });
 
+  function isRelayDrag(event: DragEvent): boolean {
+    return event.dataTransfer?.types.includes(SEND_DND_MIME) ?? false;
+  }
+
+  function handleDragEnter(event: DragEvent): void {
+    if (!isRelayDrag(event)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    dropActive = true;
+  }
+
+  function handleDragOver(event: DragEvent): void {
+    if (!isRelayDrag(event)) return;
+    // Required for the browser to fire a drop event.
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }
+
+  function handleDragLeave(event: DragEvent): void {
+    if (!isRelayDrag(event)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropActive = false;
+  }
+
+  function handleDrop(event: DragEvent): void {
+    if (!isRelayDrag(event)) return;
+    event.preventDefault();
+    dragDepth = 0;
+    dropActive = false;
+    const raw = event.dataTransfer?.getData(SEND_DND_MIME);
+    const text = event.dataTransfer?.getData("text/plain");
+    if (!raw || !text) return;
+    let payload: { sourcePaneId?: string } = {};
+    try {
+      payload = JSON.parse(raw) as { sourcePaneId?: string };
+    } catch {
+      return;
+    }
+    const sourcePaneId = payload.sourcePaneId;
+    if (!sourcePaneId) return;
+    // Reject same-pane drops — the source can't usefully send to itself and
+    // the preview modal would show a meaningless "X → X" route.
+    if (paneId && sourcePaneId === paneId) return;
+    onsenddropped?.({ sourcePaneId, text });
+  }
+
   function handleContextMenu(event: MouseEvent) {
     if (sendTargets.length === 0) return;
     // If there's no selection there's nothing to send; let the native menu
@@ -589,7 +658,17 @@
      the terminal, and PR-09 adds Cmd+1..N. -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="pane" class:focused onclick={handleFocusRequest} oncontextmenu={handleContextMenu}>
+<div
+  class="pane"
+  class:focused
+  class:drop-active={dropActive}
+  onclick={handleFocusRequest}
+  oncontextmenu={handleContextMenu}
+  ondragenter={handleDragEnter}
+  ondragover={handleDragOver}
+  ondragleave={handleDragLeave}
+  ondrop={handleDrop}
+>
   <header class="pane-header">
     <span class="label">{label}</span>
     <span class="status status-{status}" data-testid="pane-status">
@@ -683,6 +762,8 @@
       {fontFamily}
       theme={terminalTheme}
       {scrollback}
+      {paneId}
+      sourceLabel={label}
       onready={handleTerminalReady}
       ondata={handleData}
       onresize={handleResize}
