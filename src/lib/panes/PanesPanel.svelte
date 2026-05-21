@@ -156,7 +156,7 @@
 
 <Modal {open} {onclose} label="Pane settings" testid="panes-panel">
   <header class="panes-header">
-    <h2>Panes</h2>
+    <h2>Pane Settings</h2>
     <div class="panes-tabs" role="tablist">
       {#each panes as row (row.id)}
         <button

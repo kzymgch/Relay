@@ -14,9 +14,19 @@
 .panes-tabs {
   display: flex;
   gap: 4px;
+  /* Allow horizontal scrolling when there are many panes, but hide the
+   * scrollbar — macOS' overlay scrollbar otherwise leaves a thin track
+   * remnant in the top-right of the tab strip even when no overflow is
+   * present. */
   overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
   border-bottom: 1px solid var(--relay-toolbar-border);
   margin-top: 4px;
+}
+
+.panes-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .panes-tab {

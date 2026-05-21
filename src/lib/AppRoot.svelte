@@ -951,7 +951,7 @@
       data-testid="panes-toolbar-toggle"
       title="Pane settings"
     >
-      Panes
+      Pane Settings
     </button>
   </div>
   <div class="layout" bind:clientWidth={viewportW} bind:clientHeight={viewportH}>
