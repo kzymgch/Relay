@@ -36,8 +36,9 @@ export interface TerminalProps {
   /** Reactive — re-applied to the live terminal whenever the prop changes. */
   cursorBlink?: boolean;
   /**
-   * Init-only. Changing this prop after mount has no effect; resizing the
-   * scrollback buffer at runtime can drop history, so we don't expose it.
+   * Reactive: re-applied to the live terminal when the prop changes.
+   * Note that *shrinking* the buffer drops the oldest history — that's a
+   * property of xterm.js's resize, not a bug here.
    */
   scrollback?: number;
   ondata?: (data: string) => void;

@@ -36,6 +36,11 @@
   // keystroke (which would fight the user's cursor in the textarea).
   let defaultPaneArgsRaw: string = $state("");
   let presetArgsRaw: string[] = $state([]);
+  // Keybind is stored on the wire as `Record<action.id, combo>`. The form
+  // edits a parallel `Array<{action, combo}>` because object keys can't
+  // be reactively bound to inputs (renaming a key would lose the input
+  // focus on every keystroke).
+  let keybindRows: { action: string; combo: string }[] = $state([]);
   let importPath: string = $state("");
   let exportPath: string = $state("");
   let lastStatus: string = $state("");
@@ -50,6 +55,7 @@
     draft = snap;
     defaultPaneArgsRaw = snap.defaultPane.args.join(" ");
     presetArgsRaw = snap.pane.preset.map((p) => p.args.join(" "));
+    keybindRows = Object.entries(snap.keybind).map(([action, combo]) => ({ action, combo }));
     lastStatus = "";
     if (initialSection) {
       void tick().then(() => scrollToSection(initialSection));
@@ -88,15 +94,38 @@
     presetArgsRaw = presetArgsRaw.filter((_, i) => i !== idx);
   }
 
+  function addKeybind(): void {
+    keybindRows = [...keybindRows, { action: "", combo: "" }];
+  }
+
+  function removeKeybind(idx: number): void {
+    keybindRows = keybindRows.filter((_, i) => i !== idx);
+  }
+
+  /** Collapse the form rows into the `Record<action, combo>` shape. The
+   * last row wins when duplicate action keys exist; empty actions are
+   * dropped. */
+  function keybindMap(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const { action, combo } of keybindRows) {
+      const a = action.trim();
+      if (!a) continue;
+      out[a] = combo.trim();
+    }
+    return out;
+  }
+
   async function save(): Promise<void> {
     try {
-      // Re-derive args from the raw text just before persisting so the
-      // user's edits inside the input fields make it onto the wire.
+      // Re-derive args + keybind map from the form mirrors just before
+      // persisting so the user's edits inside the input fields make it
+      // onto the wire.
       draft.defaultPane.args = parseSpaceArgs(defaultPaneArgsRaw);
       draft.pane.preset = draft.pane.preset.map((p, i) => ({
         ...p,
         args: parseSpaceArgs(presetArgsRaw[i] ?? ""),
       }));
+      draft.keybind = keybindMap();
       await config.set(draft);
       lastStatus = "Saved.";
     } catch (e) {
@@ -131,6 +160,12 @@
       // the canonical config.toml.
       await config.set(next);
       draft = next;
+      // Re-seed the form mirrors from the imported config too — otherwise
+      // the next Save would re-derive args / keybind from the stale form
+      // values and silently overwrite what was just imported.
+      defaultPaneArgsRaw = next.defaultPane.args.join(" ");
+      presetArgsRaw = next.pane.preset.map((p) => p.args.join(" "));
+      keybindRows = Object.entries(next.keybind).map(([action, combo]) => ({ action, combo }));
       lastStatus = `Imported from ${path}`;
     } catch (e) {
       lastStatus = `Import failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -323,20 +358,65 @@
 
     <section class="settings-section" data-testid="settings-theme">
       <h3>Theme</h3>
-      <span class="settings-readonly">Mode</span>
-      <span class="settings-readonly">{draft.theme.mode} (editor lands in a later phase)</span>
-      <span class="settings-readonly">Preset</span>
-      <span class="settings-readonly">{draft.theme.preset}</span>
+      <label for="settings-theme-mode">Mode</label>
+      <select
+        id="settings-theme-mode"
+        bind:value={draft.theme.mode}
+        data-testid="settings-theme-mode"
+      >
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+      </select>
+      <label for="settings-theme-preset">Preset</label>
+      <input
+        id="settings-theme-preset"
+        type="text"
+        placeholder="default"
+        bind:value={draft.theme.preset}
+        data-testid="settings-theme-preset"
+      />
     </section>
 
-    <section class="settings-section" data-testid="settings-keybind">
+    <section class="settings-section settings-keybind" data-testid="settings-keybind">
       <h3>Keybindings</h3>
-      <span class="settings-readonly">Status</span>
-      <span class="settings-readonly">
-        {Object.keys(draft.keybind).length} custom binding{Object.keys(draft.keybind).length === 1
-          ? ""
-          : "s"} — editor lands in a later phase
+      <span class="settings-readonly settings-keybind-help">
+        Stored under <code>[keybind]</code> in config.toml. Combos (e.g.
+        <code>cmd+p</code>) round-trip through save / import but are not yet re-dispatched at
+        runtime — that ships with the full keybind system.
       </span>
+      {#each keybindRows as row, idx (idx)}
+        <div class="settings-keybind-row" data-testid={`settings-keybind-row-${idx}`}>
+          <input
+            type="text"
+            placeholder="action.id (e.g. palette.open)"
+            bind:value={row.action}
+            data-testid={`settings-keybind-action-${idx}`}
+          />
+          <input
+            type="text"
+            placeholder="combo (e.g. cmd+p)"
+            bind:value={row.combo}
+            data-testid={`settings-keybind-combo-${idx}`}
+          />
+          <button
+            type="button"
+            class="settings-preset-remove"
+            onclick={() => removeKeybind(idx)}
+            data-testid={`settings-keybind-remove-${idx}`}
+            aria-label="Remove keybinding"
+          >
+            ×
+          </button>
+        </div>
+      {/each}
+      <button
+        type="button"
+        class="settings-preset-add"
+        onclick={addKeybind}
+        data-testid="settings-keybind-add"
+      >
+        + Add binding
+      </button>
     </section>
 
     <section class="settings-section" data-testid="settings-import-export">

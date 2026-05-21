@@ -121,6 +121,14 @@
       term.options.cursorBlink = cursorBlink;
     }
   });
+  $effect(() => {
+    if (term && scrollback !== undefined) {
+      // xterm.js supports live resizing of the scrollback buffer via the
+      // `scrollback` option; shrinking drops the oldest history but the
+      // current viewport is preserved.
+      term.options.scrollback = scrollback;
+    }
+  });
 </script>
 
 <div bind:this={containerEl} class="terminal-container"></div>

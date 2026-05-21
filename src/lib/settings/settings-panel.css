@@ -119,3 +119,38 @@
   outline: 2px solid #3b6ef0;
   transition: outline-color 600ms ease-out;
 }
+.settings-keybind {
+  grid-template-columns: 1fr;
+}
+.settings-keybind-help {
+  margin-bottom: 4px;
+}
+.settings-keybind-help code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.settings-keybind-row {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.settings-keybind-row input {
+  width: 100%;
+  background: #2b2d31;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+}
+.settings-section select {
+  background: #2b2d31;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+}

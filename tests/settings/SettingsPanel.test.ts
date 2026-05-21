@@ -147,6 +147,67 @@ describe("SettingsPanel", () => {
     });
   });
 
+  it("Theme mode dropdown writes through to config_save", async () => {
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    const select = container.querySelector(
+      '[data-testid="settings-theme-mode"]'
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("dark");
+    select.value = "light";
+    await fireEvent.change(select);
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      expect((save!.args.config as { theme: { mode: string } }).theme.mode).toBe("light");
+    });
+  });
+
+  it("Keybind editor adds, edits, and removes entries that round-trip to the wire map", async () => {
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    // Add two rows.
+    const addBtn = container.querySelector('[data-testid="settings-keybind-add"]') as HTMLElement;
+    await fireEvent.click(addBtn);
+    await fireEvent.click(addBtn);
+    // Fill them in.
+    const action0 = container.querySelector(
+      '[data-testid="settings-keybind-action-0"]'
+    ) as HTMLInputElement;
+    const combo0 = container.querySelector(
+      '[data-testid="settings-keybind-combo-0"]'
+    ) as HTMLInputElement;
+    const action1 = container.querySelector(
+      '[data-testid="settings-keybind-action-1"]'
+    ) as HTMLInputElement;
+    const combo1 = container.querySelector(
+      '[data-testid="settings-keybind-combo-1"]'
+    ) as HTMLInputElement;
+    await fireEvent.input(action0, { target: { value: "palette.open" } });
+    await fireEvent.input(combo0, { target: { value: "cmd+p" } });
+    await fireEvent.input(action1, { target: { value: "settings.open" } });
+    await fireEvent.input(combo1, { target: { value: "cmd+," } });
+    // Remove the first one.
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-keybind-remove-0"]') as HTMLElement
+    );
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const map = (save!.args.config as { keybind: Record<string, string> }).keybind;
+      // Only the kept (originally index 1) binding survives.
+      expect(map).toEqual({ "settings.open": "cmd+," });
+    });
+  });
+
   it("initialSection prop scrolls the matching section into view", async () => {
     captureWith();
     const config = createConfigStore();
@@ -163,6 +224,67 @@ describe("SettingsPanel", () => {
     // The `highlight` class should land on the matching section.
     const section = container.querySelector('[data-testid="settings-scrollback"]') as HTMLElement;
     expect(section.classList.contains("highlight")).toBe(true);
+  });
+
+  it("Import refreshes the raw args strings so the next Save preserves imported pane args", async () => {
+    // Regression: previously, onImport replaced `draft` but left the
+    // raw-string mirrors stale. The subsequent Save re-derived args from
+    // the stale strings and clobbered the imported pane definitions.
+    captureWith((cmd) => {
+      if (cmd === "config_import") {
+        const cfg = defaultConfig();
+        cfg.defaultPane.args = ["-lic", "newer"];
+        cfg.pane.preset = [
+          {
+            label: "lint",
+            command: "pnpm",
+            args: ["lint", "--fix"],
+            cwd: null,
+            env: {},
+          },
+        ];
+        return cfg;
+      }
+      return undefined;
+    });
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    // Trigger Import.
+    const pathInput = container.querySelector(
+      '[data-testid="settings-import-path"]'
+    ) as HTMLInputElement;
+    await fireEvent.input(pathInput, { target: { value: "/tmp/relay.toml" } });
+    await fireEvent.click(
+      container.querySelector('[data-testid="settings-import"]') as HTMLElement
+    );
+    await vi.waitFor(() => {
+      const argsInput = container.querySelector(
+        '[data-testid="settings-default-args"]'
+      ) as HTMLInputElement;
+      expect(argsInput.value).toBe("-lic newer");
+    });
+    // The preset row 0 args input must also reflect the imported args.
+    const presetArgs = container.querySelector(
+      '[data-testid="settings-pane-preset-args-0"]'
+    ) as HTMLInputElement;
+    expect(presetArgs.value).toBe("lint --fix");
+
+    // Now Save: the persisted config should match the imported args
+    // exactly, NOT the stale (originally empty) form values.
+    calls.length = 0;
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const cfg = save!.args.config as {
+        defaultPane: { args: string[] };
+        pane: { preset: { args: string[] }[] };
+      };
+      expect(cfg.defaultPane.args).toEqual(["-lic", "newer"]);
+      expect(cfg.pane.preset[0]!.args).toEqual(["lint", "--fix"]);
+    });
   });
 
   it("Import calls config_import and then config_save", async () => {
