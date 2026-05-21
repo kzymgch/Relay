@@ -29,6 +29,14 @@
     getPtyId(): string | undefined;
     /** Selected text in the embedded xterm, or `undefined` when nothing is selected. */
     getSelection(): string | undefined;
+    /** Pull keyboard focus to the embedded terminal. */
+    focus(): void;
+    /** Clear the terminal buffer (Cmd+K). No-op if the terminal isn't ready. */
+    clear(): void;
+    /** Restart the PTY: kill, then respawn with the same config (Cmd+R). */
+    restart(): void;
+    /** Open the in-pane search bar and focus its input (Cmd+F). */
+    openSearch(): void;
   }
 
   /** A "Send to" entry rendered in the pane's right-click menu. */
@@ -43,6 +51,11 @@
     args?: string[];
     cwd?: string;
     env?: Record<string, string>;
+    /**
+     * Per-app font size in CSS pixels. Owned by AppRoot so Cmd+/- adjusts
+     * every pane in lock-step; PR-18 will surface this in the settings GUI.
+     */
+    fontSize?: number;
     focused?: boolean;
     onfocus?: () => void;
     /**
@@ -70,6 +83,7 @@
     args = [],
     cwd,
     env,
+    fontSize,
     focused = false,
     onfocus,
     onclose,
@@ -82,6 +96,9 @@
   let errorMessage: string | undefined = $state();
   let api: TerminalApi | undefined = $state();
   let menu: { x: number; y: number } | null = $state(null);
+  let searchOpen: boolean = $state(false);
+  let searchQuery: string = $state("");
+  let searchInputEl: HTMLInputElement | undefined = $state();
 
   // Non-reactive bookkeeping. `currentPtyId` is the id our listeners route to
   // right now; clearing it instantly detaches the listeners from any
@@ -275,6 +292,36 @@
     menu = null;
   }
 
+  function openSearch() {
+    searchOpen = true;
+    // Focus the input on the next tick — the element only exists after the
+    // {#if searchOpen} block renders.
+    queueMicrotask(() => searchInputEl?.focus());
+  }
+
+  function closeSearch() {
+    searchOpen = false;
+    searchQuery = "";
+    // Return focus to the terminal so keystrokes go to the shell again.
+    api?.focus();
+  }
+
+  function searchSubmit(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+      return;
+    }
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (!searchQuery) return;
+    if (event.shiftKey) {
+      api?.findPrevious(searchQuery);
+    } else {
+      api?.findNext(searchQuery);
+    }
+  }
+
   onMount(() => {
     const handle: PaneHandle = {
       // Captured by closure so callers always see the latest values without
@@ -284,6 +331,12 @@
       },
       getPtyId: () => currentPtyId,
       getSelection: () => api?.getSelection(),
+      focus: () => api?.focus(),
+      clear: () => api?.clear(),
+      restart: () => {
+        void restart();
+      },
+      openSearch,
     };
     onregister?.(handle);
     return () => {
@@ -342,7 +395,43 @@
     {#if status === "error"}
       <div class="pane-error" data-testid="pane-error">PTY error: {errorMessage ?? "unknown"}</div>
     {/if}
-    <Terminal onready={handleTerminalReady} ondata={handleData} onresize={handleResize} />
+    {#if searchOpen}
+      <div class="pane-search" data-testid="pane-search">
+        <input
+          bind:this={searchInputEl}
+          bind:value={searchQuery}
+          type="text"
+          placeholder="Find"
+          aria-label="Find in pane"
+          onkeydown={searchSubmit}
+        />
+        <button
+          type="button"
+          onclick={() => searchQuery && api?.findPrevious(searchQuery)}
+          aria-label="Find previous"
+          title="Previous (Shift+Enter)"
+        >
+          ↑
+        </button>
+        <button
+          type="button"
+          onclick={() => searchQuery && api?.findNext(searchQuery)}
+          aria-label="Find next"
+          title="Next (Enter)"
+        >
+          ↓
+        </button>
+        <button type="button" onclick={closeSearch} aria-label="Close search" title="Close (Esc)">
+          ✕
+        </button>
+      </div>
+    {/if}
+    <Terminal
+      {fontSize}
+      onready={handleTerminalReady}
+      ondata={handleData}
+      onresize={handleResize}
+    />
   </div>
 
   {#if menu}
