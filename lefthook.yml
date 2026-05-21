@@ -1,0 +1,21 @@
+pre-commit:
+  parallel: true
+  commands:
+    prettier:
+      glob: "*.{js,ts,svelte,json,md,yml,yaml,html,css}"
+      run: pnpm exec prettier --write {staged_files}
+      stage_fixed: true
+    eslint:
+      glob: "*.{js,ts,svelte}"
+      run: pnpm exec eslint --fix {staged_files}
+      stage_fixed: true
+    rustfmt:
+      root: src-tauri
+      glob: "*.rs"
+      run: cargo fmt --manifest-path Cargo.toml -- {staged_files}
+      stage_fixed: true
+
+commit-msg:
+  commands:
+    commitlint:
+      run: pnpm exec commitlint --edit {1}
