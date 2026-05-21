@@ -26,6 +26,12 @@ export interface PipeRule {
 
 export interface PipeFiredPayload {
   ruleId: string;
+  /**
+   * Lines delivered to the target since the last `pipe:fired` event for
+   * this rule. Per-line modes (`lineRealtime` / `regexMatch`) increment by
+   * 1 per delivered line; `tailPeriodic` and `onExit` report the size of
+   * the flushed payload, not the flush count.
+   */
   count: number;
 }
 

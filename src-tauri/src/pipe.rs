@@ -520,6 +520,7 @@ impl PipeRegistry {
             if accumulated.is_empty() {
                 continue;
             }
+            let line_count = accumulated.len() as u32;
             let joined: Vec<u8> = accumulated.join(&b'\n');
             let body = String::from_utf8_lossy(&joined).into_owned();
             let payload = build_send_payload(&body, PIPE_BRACKETED_PASTE, PIPE_TRAILING_NEWLINE);
@@ -532,7 +533,13 @@ impl PipeRegistry {
                 }
                 continue;
             }
-            record_fire(state, now, &mut fired_events, &mut auto_disabled);
+            record_fire(
+                state,
+                now,
+                line_count,
+                &mut fired_events,
+                &mut auto_disabled,
+            );
         }
         drop(rules);
         for p in fired_events {
@@ -568,6 +575,7 @@ impl PipeRegistry {
                 continue;
             }
             let drained: Vec<Vec<u8>> = state.ring.drain(..).collect();
+            let line_count = drained.len() as u32;
             let joined: Vec<u8> = drained.join(&b'\n');
             let body = String::from_utf8_lossy(&joined).into_owned();
             let payload = build_send_payload(&body, PIPE_BRACKETED_PASTE, PIPE_TRAILING_NEWLINE);
@@ -580,7 +588,13 @@ impl PipeRegistry {
                 }
                 continue;
             }
-            record_fire(state, now, &mut fired_events, &mut auto_disabled);
+            record_fire(
+                state,
+                now,
+                line_count,
+                &mut fired_events,
+                &mut auto_disabled,
+            );
         }
         drop(rules);
         for p in fired_events {
@@ -655,7 +669,7 @@ fn dispatch_line(
             let body = String::from_utf8_lossy(line).into_owned();
             let payload = build_send_payload(&body, PIPE_BRACKETED_PASTE, PIPE_TRAILING_NEWLINE);
             match pty.write(&state.rule.target, &payload) {
-                Ok(()) => record_fire(state, now, fired, auto_disabled),
+                Ok(()) => record_fire(state, now, 1, fired, auto_disabled),
                 Err(e) => {
                     if e.to_string().contains("unknown pty id") {
                         target_gone.push(TargetGonePayload {
@@ -681,12 +695,28 @@ fn dispatch_line(
     }
 }
 
+/// Record one delivery event. `lines` is the number of lines that just
+/// reached the target — `1` for lineRealtime / regexMatch (per-line
+/// delivery) and the size of the flushed payload for tailPeriodic /
+/// onExit. The two counters serve different jobs:
+///
+/// - `firings` (auto-disable) increments by **one per delivery event**.
+///   Counting per line would auto-disable any tailPeriodic rule that ever
+///   buffered more than 50 lines per tick, which is the normal usage
+///   pattern for periodic flushes.
+/// - `pending_fired_count` increments by `lines` so the emitted
+///   `pipe:fired.count` matches its documented contract ("lines delivered
+///   since the last event").
 fn record_fire(
     state: &mut RuleState,
     now: Instant,
+    lines: u32,
     fired: &mut Vec<FiredPayload>,
     auto_disabled: &mut Vec<AutoDisabledPayload>,
 ) {
+    if lines == 0 {
+        return;
+    }
     // Update sliding window first so auto-disable sees the freshly-fired
     // count.
     while let Some(front) = state.firings.front() {
@@ -697,7 +727,7 @@ fn record_fire(
         }
     }
     state.firings.push_back(now);
-    state.pending_fired_count += 1;
+    state.pending_fired_count = state.pending_fired_count.saturating_add(lines);
 
     if state.firings.len() > AUTO_DISABLE_FIRES {
         state.rule.enabled = false;
@@ -1161,23 +1191,71 @@ mod tests {
         let mut state = RuleState::from_rule(rule("r", "a", "b", PipeMode::LineRealtime)).unwrap();
         let mut fired: Vec<FiredPayload> = Vec::new();
         let mut disabled: Vec<AutoDisabledPayload> = Vec::new();
-        // Three back-to-back fires within the debounce window collapse to
-        // a single event whose `count` reflects the burst.
-        record_fire(&mut state, now, &mut fired, &mut disabled);
+        // Three back-to-back single-line fires within the debounce window
+        // collapse to one event. The first emit fires immediately (no prior
+        // event); the next two add to `pending_fired_count` until the next
+        // call past the debounce window picks them up.
+        record_fire(&mut state, now, 1, &mut fired, &mut disabled);
         record_fire(
             &mut state,
             now + Duration::from_millis(5),
+            1,
             &mut fired,
             &mut disabled,
         );
         record_fire(
             &mut state,
             now + Duration::from_millis(10),
+            1,
             &mut fired,
             &mut disabled,
         );
         assert_eq!(fired.len(), 1, "debounce should collapse: {:?}", fired);
         assert_eq!(fired[0].count, 1, "first emit reflects single fire");
+        assert_eq!(
+            state.pending_fired_count, 2,
+            "subsequent fires sit in pending until the next debounce window"
+        );
+    }
+
+    #[test]
+    fn record_fire_count_aggregates_lines_in_a_single_delivery() {
+        // A tailPeriodic / onExit flush passes the line count in a single
+        // record_fire call. The first emit must report that full count —
+        // not 1 — so external consumers see "lines delivered", not
+        // "deliveries".
+        let now = Instant::now();
+        let mut state = RuleState::from_rule(rule(
+            "r-bulk",
+            "a",
+            "b",
+            PipeMode::TailPeriodic {
+                lines: 50,
+                interval_ms: 1000,
+            },
+        ))
+        .unwrap();
+        let mut fired: Vec<FiredPayload> = Vec::new();
+        let mut disabled: Vec<AutoDisabledPayload> = Vec::new();
+        record_fire(&mut state, now, 42, &mut fired, &mut disabled);
+        assert_eq!(fired.len(), 1, "first delivery emits immediately");
+        assert_eq!(fired[0].count, 42, "count must reflect line total");
+    }
+
+    #[test]
+    fn record_fire_auto_disable_counts_deliveries_not_lines() {
+        // Even if every delivery covers many lines (e.g. a tailPeriodic
+        // tick flushing 100 lines at a time), the auto-disable counter
+        // increments by one per delivery. Otherwise a normal periodic
+        // flush would trip the runaway threshold on the first tick.
+        let now = Instant::now();
+        let mut state = RuleState::from_rule(rule("r", "a", "b", PipeMode::LineRealtime)).unwrap();
+        let mut fired: Vec<FiredPayload> = Vec::new();
+        let mut disabled: Vec<AutoDisabledPayload> = Vec::new();
+        // A single delivery of 1000 lines must not auto-disable on its own.
+        record_fire(&mut state, now, 1000, &mut fired, &mut disabled);
+        assert!(disabled.is_empty(), "one delivery is one fire");
+        assert!(state.rule.enabled, "rule still enabled");
     }
 
     #[test]
@@ -1213,6 +1291,77 @@ mod tests {
         // Camel-case + tagged enum on the wire.
         assert!(json.contains("\"intervalMs\":250"));
         assert!(json.contains("\"kind\":\"tailPeriodic\""));
+    }
+
+    #[test]
+    fn tail_periodic_flush_reports_actual_line_count_in_fired_event() {
+        // Integration check that the public `pipe:fired.count` contract
+        // ("lines delivered since the last event") survives the trip
+        // through `tick_periodic`: a single flush of 5 buffered lines
+        // must report `count = 5`, not `1`.
+        let pty = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+        let reg = Arc::new(PipeRegistry::new(
+            pty.clone(),
+            sink.clone() as Arc<dyn PipeEventSink>,
+        ));
+        // Spawn a live cat target so the write succeeds and `record_fire`
+        // actually runs.
+        use crate::bridge::{spawn_pty, EventSink};
+        struct NullSink;
+        impl EventSink for NullSink {
+            fn emit_data(&self, _: &str, _: Vec<u8>) {}
+            fn emit_exit(&self, _: &str, _: ExitStatus) {}
+        }
+        let null: Arc<dyn EventSink> = Arc::new(NullSink);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let target = "tail-tgt".to_string();
+        rt.block_on(async {
+            spawn_pty(
+                pty.clone(),
+                null,
+                vec![],
+                target.clone(),
+                PtyConfig {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "cat".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("spawn target");
+        });
+
+        reg.upsert(rule(
+            "r-tail-count",
+            "pane-src",
+            &target,
+            PipeMode::TailPeriodic {
+                lines: 10,
+                interval_ms: 1,
+            },
+        ))
+        .unwrap();
+        reg.observe_chunk("pane-src", b"a\nb\nc\nd\ne\n");
+        // Sleep past interval_ms then flush.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.tick_periodic();
+
+        let fired = sink.fired.lock().unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "single periodic flush emits exactly one event"
+        );
+        assert_eq!(
+            fired[0].count, 5,
+            "count reflects delivered lines, not flushes"
+        );
+
+        let _ = pty.kill(&target);
     }
 
     #[test]
