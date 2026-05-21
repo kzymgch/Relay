@@ -13,9 +13,18 @@
     type PaneId as PtyId,
     type PtySpawnConfig,
   } from "./pty";
+  import { onSshStatus, sshReconnect } from "./ssh";
+  import type { SshTarget } from "./layout/tree";
   import "./pane.css";
 
-  type PaneStatus = "spawning" | "running" | "exited" | "error";
+  type PaneStatus =
+    | "spawning"
+    | "running"
+    | "exited"
+    | "error"
+    | "connecting"
+    | "reconnecting"
+    | "disconnected";
 
   /**
    * Handle the parent uses to read a pane's live state without forcing the
@@ -68,10 +77,13 @@
 
   interface Props {
     label: string;
-    command: string;
+    /** Local command. Required when `ssh` is absent; ignored when `ssh` is set. */
+    command?: string;
     args?: string[];
     cwd?: string;
     env?: Record<string, string>;
+    /** When set, the pane is a remote SSH session instead of a local PTY. */
+    ssh?: SshTarget;
     /**
      * Per-app font size in CSS pixels. Owned by AppRoot so Cmd+/- adjusts
      * every pane in lock-step; the settings GUI also writes here.
@@ -139,6 +151,7 @@
     args = [],
     cwd,
     env,
+    ssh,
     fontSize,
     fontFamily,
     terminalTheme,
@@ -158,6 +171,10 @@
   let status: PaneStatus = $state("spawning");
   let exitInfo: { code: number; success: boolean } | null = $state(null);
   let errorMessage: string | undefined = $state();
+  // 1-based once the reconnect supervisor takes over; 0 on the initial
+  // connection or while the pane is in steady-state `running` / `connected`.
+  let sshAttempt: number = $state(0);
+  const isSsh = $derived(ssh !== undefined);
   let api: TerminalApi | undefined = $state();
   let menu: { x: number; y: number } | null = $state(null);
   let searchOpen: boolean = $state(false);
@@ -180,6 +197,7 @@
   let destroyed = false;
   let unlistenData: (() => void) | undefined;
   let unlistenExit: (() => void) | undefined;
+  let unlistenSshStatus: (() => void) | undefined;
 
   // Debounced PTY-resize. xterm's FitAddon fires onResize on every container
   // size change — during a splitter drag that's once per pointermove, and
@@ -228,6 +246,37 @@
       return false;
     }
     unlistenExit = exitDispose;
+
+    // SSH lifecycle. Drives the indicator class and Reconnect-button
+    // visibility. Local panes never see these events so the listener is
+    // a no-op for them.
+    const sshDispose = await onSshStatus((payload) => {
+      if (payload.paneId !== currentPtyId) return;
+      sshAttempt = payload.attempt;
+      switch (payload.status) {
+        case "connecting":
+          status = "connecting";
+          break;
+        case "connected":
+          status = "running";
+          break;
+        case "disconnected":
+          status = "disconnected";
+          break;
+        case "reconnecting":
+          status = "reconnecting";
+          break;
+      }
+    });
+    if (destroyed) {
+      sshDispose();
+      unlistenData?.();
+      unlistenExit?.();
+      unlistenData = undefined;
+      unlistenExit = undefined;
+      return false;
+    }
+    unlistenSshStatus = sshDispose;
     return true;
   }
 
@@ -247,7 +296,25 @@
     const id = crypto.randomUUID();
     currentPtyId = id;
 
-    const cfg: PtySpawnConfig = { id, command, args, cwd, env };
+    // SSH panes leave `command` / `args` / `cwd` / `env` off the spawn
+    // config — the backend opens a remote shell over russh and the local
+    // process-launching code path is bypassed entirely.
+    const cfg: PtySpawnConfig = ssh
+      ? {
+          id,
+          ssh: {
+            host: ssh.host,
+            ...(ssh.port !== undefined && { port: ssh.port }),
+            ...(ssh.user !== undefined && { user: ssh.user }),
+            ...(ssh.identityPath !== undefined && { identityPath: ssh.identityPath }),
+            ...(ssh.sshConfigAlias !== undefined && { sshConfigAlias: ssh.sshConfigAlias }),
+            ...(ssh.useKeychainPassword !== undefined && {
+              useKeychainPassword: ssh.useKeychainPassword,
+            }),
+            ...(ssh.autoReconnect !== undefined && { autoReconnect: ssh.autoReconnect }),
+          },
+        }
+      : { id, command, args, cwd, env };
     if (api) {
       cfg.cols = api.cols;
       cfg.rows = api.rows;
@@ -281,7 +348,13 @@
       return;
     }
 
-    status = "running";
+    // For SSH panes the `ssh:status` listener has already advanced the
+    // state to `connected` (mapped to `running`) — or further, if the
+    // session has already disconnected. Don't clobber a real terminal
+    // state by force-resetting to `running` here.
+    if (!isSsh || status === "spawning") {
+      status = "running";
+    }
   }
 
   async function init() {
@@ -397,7 +470,7 @@
     // the distinction between `["-c", "echo hello world"]` and
     // `["-c", "echo", "hello", "world"]` round-tripping through the form.
     draftLabel = label;
-    draftCommand = command;
+    draftCommand = command ?? "";
     draftArgsRaw = (args ?? []).join("\n");
     draftCwd = cwd ?? "";
     draftEnvRaw = Object.entries(env ?? {})
@@ -491,8 +564,10 @@
       onregister?.(undefined);
       unlistenData?.();
       unlistenExit?.();
+      unlistenSshStatus?.();
       unlistenData = undefined;
       unlistenExit = undefined;
+      unlistenSshStatus = undefined;
       if (resizeTimer) {
         clearTimeout(resizeTimer);
         resizeTimer = undefined;
@@ -519,9 +594,17 @@
     <span class="label">{label}</span>
     <span class="status status-{status}" data-testid="pane-status">
       {#if status === "running"}
-        ● running
+        ● {isSsh ? "connected" : "running"}
       {:else if status === "spawning"}
         ◌ starting
+      {:else if status === "connecting"}
+        ◌ connecting{#if sshAttempt > 0}
+          (attempt {sshAttempt}){/if}
+      {:else if status === "reconnecting"}
+        ↻ reconnecting{#if sshAttempt > 0}
+          (attempt {sshAttempt}){/if}
+      {:else if status === "disconnected"}
+        ◯ disconnected
       {:else if status === "exited"}
         ■ exited{#if exitInfo}
           (code {exitInfo.code}){/if}
@@ -530,6 +613,20 @@
       {/if}
     </span>
     <div class="actions">
+      {#if isSsh && (status === "disconnected" || status === "reconnecting")}
+        <button
+          type="button"
+          onclick={() => {
+            const id = currentPtyId;
+            if (id) sshReconnect(id).catch(() => undefined);
+          }}
+          title="Reconnect now"
+          aria-label="Reconnect SSH session"
+          data-testid="pane-ssh-reconnect"
+        >
+          ⤴
+        </button>
+      {/if}
       <button type="button" onclick={openSettings} title="Pane settings" aria-label="Pane settings">
         ⚙
       </button>

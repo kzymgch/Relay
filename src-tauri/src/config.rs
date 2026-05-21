@@ -131,6 +131,11 @@ pub struct PaneSpecConfig {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
+    /// SSH connection parameters. When present, the pane is opened as an
+    /// SSH remote instead of running `command` locally. The frontend mirrors
+    /// this field on `PaneSpec.ssh` so sessions persist transparently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshPaneConfig>,
 }
 
 impl Default for PaneSpecConfig {
@@ -141,6 +146,36 @@ impl Default for PaneSpecConfig {
             args: vec!["-l".into()],
             cwd: None,
             env: HashMap::new(),
+            ssh: None,
+        }
+    }
+}
+
+/// TOML representation of an SSH pane target. Mirrors `SshSpawnConfig` in
+/// `bridge.rs` and `SshTarget` in the frontend. All fields except `host`
+/// fall back to `~/.ssh/config` lookup at connect time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SshPaneConfig {
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub identity_path: Option<String>,
+    pub ssh_config_alias: Option<String>,
+    pub use_keychain_password: bool,
+    pub auto_reconnect: bool,
+}
+
+impl Default for SshPaneConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: None,
+            user: None,
+            identity_path: None,
+            ssh_config_alias: None,
+            use_keychain_password: false,
+            auto_reconnect: true,
         }
     }
 }
@@ -263,13 +298,22 @@ pub fn validate(cfg: &RelayConfig) -> Result<(), ConfigError> {
         }
     }
     for (idx, p) in cfg.pane.preset.iter().enumerate() {
-        if p.command.trim().is_empty() {
+        // SSH panes are allowed to omit `command` — the connect target
+        // supplies the remote shell. Local panes still need a command.
+        if p.ssh.is_none() && p.command.trim().is_empty() {
             return Err(ConfigError::Validation(format!(
                 "pane.preset[{idx}].command must not be empty"
             )));
         }
+        if let Some(s) = &p.ssh {
+            if s.host.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "pane.preset[{idx}].ssh.host must not be empty"
+                )));
+            }
+        }
     }
-    if cfg.default_pane.command.trim().is_empty() {
+    if cfg.default_pane.ssh.is_none() && cfg.default_pane.command.trim().is_empty() {
         return Err(ConfigError::Validation(
             "defaultPane.command must not be empty".into(),
         ));

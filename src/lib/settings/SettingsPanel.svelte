@@ -313,28 +313,79 @@
             bind:value={preset.label}
             data-testid={`settings-pane-preset-label-${idx}`}
           />
-          <input
-            type="text"
-            placeholder="command"
-            bind:value={preset.command}
-            data-testid={`settings-pane-preset-command-${idx}`}
-          />
-          <input
-            type="text"
-            placeholder="args (space-sep)"
-            bind:value={presetArgsRaw[idx]}
-            data-testid={`settings-pane-preset-args-${idx}`}
-          />
-          <input
-            type="text"
-            placeholder="cwd"
-            value={preset.cwd ?? ""}
-            oninput={(e) => {
-              const v = (e.currentTarget as HTMLInputElement).value;
-              preset.cwd = v.trim() === "" ? null : v;
-            }}
-            data-testid={`settings-pane-preset-cwd-${idx}`}
-          />
+          <label class="settings-preset-kind">
+            <input
+              type="checkbox"
+              checked={preset.ssh != null}
+              onchange={(e) => {
+                const on = (e.currentTarget as HTMLInputElement).checked;
+                preset.ssh = on
+                  ? {
+                      host: "",
+                      port: null,
+                      user: null,
+                      identityPath: null,
+                      sshConfigAlias: null,
+                      useKeychainPassword: false,
+                      autoReconnect: true,
+                    }
+                  : null;
+              }}
+              data-testid={`settings-pane-preset-ssh-toggle-${idx}`}
+            />
+            SSH
+          </label>
+          {#if preset.ssh}
+            <input
+              type="text"
+              placeholder="ssh host"
+              bind:value={preset.ssh.host}
+              data-testid={`settings-pane-preset-ssh-host-${idx}`}
+            />
+            <input
+              type="text"
+              placeholder="ssh_config alias (optional)"
+              value={preset.ssh.sshConfigAlias ?? ""}
+              oninput={(e) => {
+                const v = (e.currentTarget as HTMLInputElement).value;
+                if (preset.ssh) preset.ssh.sshConfigAlias = v.trim() === "" ? null : v;
+              }}
+              data-testid={`settings-pane-preset-ssh-alias-${idx}`}
+            />
+            <input
+              type="text"
+              placeholder="user (optional)"
+              value={preset.ssh.user ?? ""}
+              oninput={(e) => {
+                const v = (e.currentTarget as HTMLInputElement).value;
+                if (preset.ssh) preset.ssh.user = v.trim() === "" ? null : v;
+              }}
+              data-testid={`settings-pane-preset-ssh-user-${idx}`}
+            />
+          {:else}
+            <input
+              type="text"
+              placeholder="command"
+              bind:value={preset.command}
+              data-testid={`settings-pane-preset-command-${idx}`}
+            />
+            <input
+              type="text"
+              placeholder="args (space-sep)"
+              bind:value={presetArgsRaw[idx]}
+              data-testid={`settings-pane-preset-args-${idx}`}
+            />
+            <input
+              type="text"
+              placeholder="cwd"
+              value={preset.cwd ?? ""}
+              oninput={(e) => {
+                const v = (e.currentTarget as HTMLInputElement).value;
+                preset.cwd = v.trim() === "" ? null : v;
+              }}
+              data-testid={`settings-pane-preset-cwd-${idx}`}
+            />
+          {/if}
           <button
             type="button"
             class="settings-preset-remove"

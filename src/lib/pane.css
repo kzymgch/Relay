@@ -56,6 +56,18 @@
   color: #f87171;
 }
 
+.pane-header .status-connecting {
+  color: #fbbf24;
+}
+
+.pane-header .status-reconnecting {
+  color: #fb923c;
+}
+
+.pane-header .status-disconnected {
+  color: #f87171;
+}
+
 .pane-header .actions {
   display: flex;
   gap: 4px;

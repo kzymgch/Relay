@@ -834,6 +834,7 @@
           args={pane.args}
           cwd={pane.cwd}
           env={pane.env}
+          ssh={pane.ssh}
           {fontSize}
           {fontFamily}
           {terminalTheme}

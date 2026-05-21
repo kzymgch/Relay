@@ -40,12 +40,24 @@ export interface SessionSettings {
   restoreOnLaunch: boolean;
 }
 
+export interface SshPaneConfig {
+  host: string;
+  port: number | null;
+  user: string | null;
+  identityPath: string | null;
+  sshConfigAlias: string | null;
+  useKeychainPassword: boolean;
+  autoReconnect: boolean;
+}
+
 export interface PaneSpecConfig {
   label: string;
   command: string;
   args: string[];
   cwd: string | null;
   env: Record<string, string>;
+  /** When present, the preset opens as an SSH remote pane. */
+  ssh?: SshPaneConfig | null;
 }
 
 export interface PaneSection {

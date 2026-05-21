@@ -23,6 +23,8 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
 use crate::pty::{ExitStatus, Pty, PtyConfig, PtyError};
+use crate::ssh::{BackoffPolicy, SshAuth, SshConnectConfig, SshSession};
+use tokio::sync::oneshot;
 
 /// Default coalescing thresholds for PTY → frontend forwarding.
 const FLUSH_BYTES: usize = 32 * 1024;
@@ -44,6 +46,28 @@ pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 pub const EVENT_DATA: &str = "pty:data";
 pub const EVENT_EXIT: &str = "pty:exit";
+pub const EVENT_SSH_STATUS: &str = "ssh:status";
+
+/// Stages of an SSH pane's lifecycle. Surfaces in the UI status indicator
+/// and drives the Reconnect button's visibility. `attempt` is 1-based; 0 on
+/// the very first connection (no retry yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SshStatus {
+    Connecting,
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshStatusPayload {
+    pub pane_id: String,
+    pub status: SshStatus,
+    pub attempt: u32,
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +89,9 @@ pub struct PtyExitPayload {
 pub trait EventSink: Send + Sync {
     fn emit_data(&self, pane_id: &str, data: Vec<u8>);
     fn emit_exit(&self, pane_id: &str, status: ExitStatus);
+    /// SSH lifecycle. Default no-op so existing test sinks compile without
+    /// updates; the real Tauri sink overrides this.
+    fn emit_ssh_status(&self, _pane_id: &str, _status: SshStatus, _attempt: u32) {}
 }
 
 /// Additional per-pane output observer attached to every spawned PTY. Unlike
@@ -113,18 +140,39 @@ impl EventSink for TauriEventSink {
             },
         );
     }
+
+    fn emit_ssh_status(&self, pane_id: &str, status: SshStatus, attempt: u32) {
+        let _ = self.app.emit(
+            EVENT_SSH_STATUS,
+            SshStatusPayload {
+                pane_id: pane_id.into(),
+                status,
+                attempt,
+                message: None,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
+/// Inner variant for a registered pane: either a locally spawned `Pty`
+/// or an SSH session. Both share the same write / resize / kill surface
+/// at this layer; the forward task pipeline doesn't care which is which.
+pub enum PaneInner {
+    Pty(Arc<Mutex<Pty>>),
+    Ssh(Arc<Mutex<SshSession>>),
+}
+
 /// Pane registry with per-pane locking.
 ///
 /// The outer `Mutex` only guards the map (lookups + insert/remove of `Arc`s).
-/// All real PTY I/O — write, resize, kill — runs under the pane's own inner
-/// `Mutex<Pty>`, so a stuck PTY (e.g. a child that has stopped reading its
-/// stdin) cannot freeze operations on the other panes.
+/// All real I/O — write, resize, kill — runs under the pane's own inner
+/// `Mutex<_>`, so a stuck pane (e.g. a child that has stopped reading its
+/// stdin, or an SSH connection whose remote stalled) cannot freeze
+/// operations on the other panes.
 #[derive(Default)]
 pub struct PtyRegistry {
     inner: Mutex<RegistryInner>,
@@ -132,7 +180,7 @@ pub struct PtyRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    ptys: HashMap<String, Arc<Mutex<Pty>>>,
+    panes: HashMap<String, PaneInner>,
 }
 
 impl PtyRegistry {
@@ -144,27 +192,89 @@ impl PtyRegistry {
     /// taken so callers don't accidentally shadow a live pane.
     fn insert(&self, id: &str, pty: Pty) -> Result<(), PtyError> {
         let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
-        if guard.ptys.contains_key(id) {
+        if guard.panes.contains_key(id) {
             return Err(PtyError::Pty(format!("pane id already exists: {id}")));
         }
-        guard.ptys.insert(id.to_string(), Arc::new(Mutex::new(pty)));
+        guard
+            .panes
+            .insert(id.to_string(), PaneInner::Pty(Arc::new(Mutex::new(pty))));
         Ok(())
     }
 
-    fn get(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
-        self.inner
-            .lock()
-            .expect("PtyRegistry poisoned")
-            .ptys
-            .get(id)
-            .cloned()
+    /// Inserts a freshly opened SSH session under `id`. Same uniqueness rule
+    /// as `insert` for PTYs.
+    pub fn insert_ssh(&self, id: &str, ssh: SshSession) -> Result<(), PtyError> {
+        let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
+        if guard.panes.contains_key(id) {
+            return Err(PtyError::Pty(format!("pane id already exists: {id}")));
+        }
+        guard
+            .panes
+            .insert(id.to_string(), PaneInner::Ssh(Arc::new(Mutex::new(ssh))));
+        Ok(())
     }
 
-    fn take(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
+    /// Replace the SSH session backing an existing entry without changing
+    /// the pane id. Used by the reconnect loop: the frontend's xterm buffer
+    /// and event listeners stay attached because the id is stable.
+    pub fn swap_ssh(&self, id: &str, ssh: SshSession) -> Result<(), PtyError> {
+        let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
+        match guard.panes.get_mut(id) {
+            Some(entry @ PaneInner::Ssh(_)) => {
+                *entry = PaneInner::Ssh(Arc::new(Mutex::new(ssh)));
+                Ok(())
+            }
+            Some(PaneInner::Pty(_)) => Err(PtyError::Pty(format!(
+                "cannot swap ssh into local pane {id}"
+            ))),
+            None => Err(Self::unknown_id(id)),
+        }
+    }
+
+    /// Look up the local PTY backing a pane id. Returns `None` for SSH panes
+    /// and unknown ids alike — callers who care about that distinction should
+    /// branch on `kind` instead.
+    pub fn get_pty(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
+        match self
+            .inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .panes
+            .get(id)?
+        {
+            PaneInner::Pty(p) => Some(p.clone()),
+            PaneInner::Ssh(_) => None,
+        }
+    }
+
+    /// Symmetric with `get_pty` but for SSH-backed panes.
+    pub fn get_ssh(&self, id: &str) -> Option<Arc<Mutex<SshSession>>> {
+        match self
+            .inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .panes
+            .get(id)?
+        {
+            PaneInner::Ssh(s) => Some(s.clone()),
+            PaneInner::Pty(_) => None,
+        }
+    }
+
+    /// Is `id` registered to any pane variant?
+    pub fn contains(&self, id: &str) -> bool {
         self.inner
             .lock()
             .expect("PtyRegistry poisoned")
-            .ptys
+            .panes
+            .contains_key(id)
+    }
+
+    fn take(&self, id: &str) -> Option<PaneInner> {
+        self.inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .panes
             .remove(id)
     }
 
@@ -173,21 +283,68 @@ impl PtyRegistry {
     }
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), PtyError> {
-        let pty = self.get(id).ok_or_else(|| Self::unknown_id(id))?;
-        let mut pty = pty.lock().expect("Pty mutex poisoned");
-        pty.write_all(data)
+        let entry = self
+            .inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .panes
+            .get(id)
+            .map(clone_inner)
+            .ok_or_else(|| Self::unknown_id(id))?;
+        match entry {
+            PaneInner::Pty(pty) => {
+                let mut pty = pty.lock().expect("Pty mutex poisoned");
+                pty.write_all(data)
+            }
+            PaneInner::Ssh(ssh) => {
+                let ssh = ssh.lock().expect("SshSession mutex poisoned");
+                ssh.write_all(data)
+                    .map_err(|e| PtyError::Pty(e.to_string()))
+            }
+        }
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), PtyError> {
-        let pty = self.get(id).ok_or_else(|| Self::unknown_id(id))?;
-        let pty = pty.lock().expect("Pty mutex poisoned");
-        pty.resize(cols, rows)
+        let entry = self
+            .inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .panes
+            .get(id)
+            .map(clone_inner)
+            .ok_or_else(|| Self::unknown_id(id))?;
+        match entry {
+            PaneInner::Pty(pty) => {
+                let pty = pty.lock().expect("Pty mutex poisoned");
+                pty.resize(cols, rows)
+            }
+            PaneInner::Ssh(ssh) => {
+                let ssh = ssh.lock().expect("SshSession mutex poisoned");
+                ssh.resize(cols, rows)
+                    .map_err(|e| PtyError::Pty(e.to_string()))
+            }
+        }
     }
 
     pub fn kill(&self, id: &str) -> Result<(), PtyError> {
-        let pty = self.take(id).ok_or_else(|| Self::unknown_id(id))?;
-        let mut pty = pty.lock().expect("Pty mutex poisoned");
-        pty.kill()
+        let entry = self.take(id).ok_or_else(|| Self::unknown_id(id))?;
+        match entry {
+            PaneInner::Pty(pty) => {
+                let mut pty = pty.lock().expect("Pty mutex poisoned");
+                pty.kill()
+            }
+            PaneInner::Ssh(ssh) => {
+                let ssh = ssh.lock().expect("SshSession mutex poisoned");
+                ssh.kill().map_err(|e| PtyError::Pty(e.to_string()))
+            }
+        }
+    }
+}
+
+fn clone_inner(entry: &PaneInner) -> PaneInner {
+    match entry {
+        PaneInner::Pty(p) => PaneInner::Pty(p.clone()),
+        PaneInner::Ssh(s) => PaneInner::Ssh(s.clone()),
     }
 }
 
@@ -236,7 +393,10 @@ pub struct PtySpawnConfig {
     /// and exit) emitted between `spawn_pty` returning the id and the
     /// frontend's continuation resuming would be dropped by id filtering.
     pub id: String,
-    pub command: String,
+    /// Local command. Required when `ssh` is absent; ignored when `ssh` is
+    /// set. Optional in the struct so the frontend can omit it for SSH panes.
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -246,6 +406,31 @@ pub struct PtySpawnConfig {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    /// When present, takes the SSH path: open a russh session against the
+    /// remote and stream its login shell through the usual `pty:data` /
+    /// `pty:exit` pipeline. `command` / `args` / `cwd` / `env` are ignored.
+    #[serde(default)]
+    pub ssh: Option<SshSpawnConfig>,
+}
+
+/// Frontend-supplied SSH connection parameters. `host` is the only required
+/// field; everything else falls back to `~/.ssh/config` lookup or sensible
+/// defaults (port 22, current user, no key). Plaintext passwords stay on the
+/// Rust side: when `useKeychainPassword` is true the backend looks up the
+/// password by `<user>@<host>` in the Relay Keychain entry; passwords never
+/// cross the IPC boundary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshSpawnConfig {
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub identity_path: Option<String>,
+    pub ssh_config_alias: Option<String>,
+    #[serde(default)]
+    pub use_keychain_password: bool,
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect: bool,
 }
 
 fn default_cols() -> u16 {
@@ -256,17 +441,24 @@ fn default_rows() -> u16 {
     24
 }
 
-impl From<PtySpawnConfig> for PtyConfig {
-    fn from(value: PtySpawnConfig) -> Self {
-        Self {
-            command: value.command,
-            args: value.args,
-            cwd: value.cwd.map(PathBuf::from),
-            env: value.env,
-            cols: value.cols,
-            rows: value.rows,
+fn default_auto_reconnect() -> bool {
+    true
+}
+
+impl PtySpawnConfig {
+    fn into_pty_config(self) -> Result<PtyConfig, PtyError> {
+        let command = self
+            .command
+            .ok_or_else(|| PtyError::Pty("command is required for local panes".into()))?;
+        Ok(PtyConfig {
+            command,
+            args: self.args,
+            cwd: self.cwd.map(PathBuf::from),
+            env: self.env,
+            cols: self.cols,
+            rows: self.rows,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -295,29 +487,287 @@ pub async fn spawn_pty(
     let id_for_task = id.clone();
 
     tokio::spawn(async move {
-        forward_loop(
+        let exit = drain_until_exit(
             sink_for_task.as_ref(),
             observers_for_task.as_slice(),
             &id_for_task,
             output_rx,
+            exit_rx,
         )
         .await;
-        let exit = exit_rx.await.ok();
-        // Fire `on_exit` on every observer BEFORE we drop the registry entry
-        // so onExit pipe rules can still consult the source pane's metadata
-        // and call `PtyRegistry::write` on their (still-live) targets.
+        // Local PTY panes have no reconnect path, so finalize unconditionally.
         if let Some(status) = exit {
-            for obs in &observers_for_task {
-                obs.on_exit(&id_for_task, status);
-            }
+            finalize_pane_exit(
+                sink_for_task.as_ref(),
+                observers_for_task.as_slice(),
+                &id_for_task,
+                status,
+            );
         }
         let _ = registry_for_task.take(&id_for_task);
-        if let Some(status) = exit {
-            sink_for_task.emit_exit(&id_for_task, status);
-        }
     });
 
     Ok(())
+}
+
+/// Forward output chunks to the sink/observers until the source's reader
+/// side closes, then await the exit status. **Does not** fire observer
+/// `on_exit` callbacks or emit a `pty:exit` event — that's the caller's
+/// job. Splitting this out lets the SSH supervisor reuse the data-pumping
+/// machinery across reconnect attempts without prematurely telling the
+/// frontend (and `onExit` pipe rules) that the pane is gone.
+async fn drain_until_exit(
+    sink: &dyn EventSink,
+    observers: &[Arc<dyn PaneOutputSink>],
+    pane_id: &str,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    exit_rx: oneshot::Receiver<ExitStatus>,
+) -> Option<ExitStatus> {
+    forward_loop(sink, observers, pane_id, output_rx).await;
+    exit_rx.await.ok()
+}
+
+/// Fire `on_exit` on every observer and emit the `pty:exit` event. Called
+/// when the pane is truly done — a clean local-PTY exit, a clean SSH
+/// logout, a user-initiated kill, or SSH reconnect attempts exhausted.
+/// Observers run BEFORE the caller drops the registry entry so onExit pipe
+/// rules can still consult the source pane's metadata and call
+/// `PtyRegistry::write` on their (still-live) targets.
+fn finalize_pane_exit(
+    sink: &dyn EventSink,
+    observers: &[Arc<dyn PaneOutputSink>],
+    pane_id: &str,
+    status: ExitStatus,
+) {
+    for obs in observers {
+        obs.on_exit(pane_id, status);
+    }
+    sink.emit_exit(pane_id, status);
+}
+
+// ---------------------------------------------------------------------------
+// SSH spawn + reconnect
+// ---------------------------------------------------------------------------
+
+/// Per-pane SSH state owned by the reconnect coordinator. Two roles:
+///
+/// - `notify` lets the frontend's `ssh_reconnect` command interrupt the
+///   supervisor's backoff sleep immediately.
+/// - `shutdown` lets `pty_kill` (and any other "user really wants this pane
+///   gone" path) tell the supervisor not to attempt reconnect — otherwise
+///   a manual close while in the middle of a backoff window would race
+///   `registry.take()` against `registry.swap_ssh()` and the user would see
+///   a futile "reconnecting" status flash before the pane disappeared.
+#[derive(Default)]
+pub struct SshState {
+    inner: Mutex<HashMap<String, PerPane>>,
+}
+
+struct PerPane {
+    notify: Arc<tokio::sync::Notify>,
+    shutdown: bool,
+}
+
+impl SshState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn slot(&self, id: &str) -> Arc<tokio::sync::Notify> {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| PerPane {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                shutdown: false,
+            })
+            .notify
+            .clone()
+    }
+
+    pub fn signal_reconnect(&self, id: &str) {
+        let guard = self.inner.lock().expect("SshState poisoned");
+        if let Some(s) = guard.get(id) {
+            s.notify.notify_waiters();
+        }
+    }
+
+    /// Mark the pane as being torn down by the user (close button, restart,
+    /// app exit). Wakes the backoff sleep so the supervisor can observe the
+    /// flag and bail without another reconnect attempt.
+    pub fn signal_shutdown(&self, id: &str) {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
+        if let Some(s) = guard.get_mut(id) {
+            s.shutdown = true;
+            s.notify.notify_waiters();
+        }
+    }
+
+    fn is_shutdown(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("SshState poisoned")
+            .get(id)
+            .map(|s| s.shutdown)
+            .unwrap_or(false)
+    }
+
+    fn drop_slot(&self, id: &str) {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
+        guard.remove(id);
+    }
+}
+
+/// Spawn an SSH pane. Opens the initial session, registers it under `id`,
+/// and starts the supervisor task that runs forward_loop + reconnect loop.
+pub async fn spawn_ssh(
+    registry: Arc<PtyRegistry>,
+    sink: Arc<dyn EventSink>,
+    observers: Vec<Arc<dyn PaneOutputSink>>,
+    ssh_state: Arc<SshState>,
+    id: String,
+    initial: SshConnectConfig,
+    auto_reconnect: bool,
+) -> Result<(), PtyError> {
+    sink.emit_ssh_status(&id, SshStatus::Connecting, 0);
+    let mut session = SshSession::connect(initial.clone())
+        .await
+        .map_err(|e| PtyError::Pty(format!("ssh connect: {e}")))?;
+    let output_rx = session.take_output_rx().expect("output rx present");
+    let exit_rx = session.take_exit_rx().expect("exit rx present");
+
+    registry.insert_ssh(&id, session)?;
+    sink.emit_ssh_status(&id, SshStatus::Connected, 0);
+
+    let registry_for_task = registry.clone();
+    let sink_for_task = sink;
+    let observers_for_task = observers;
+    let ssh_state_for_task = ssh_state.clone();
+    let id_for_task = id.clone();
+
+    tokio::spawn(async move {
+        ssh_supervisor(
+            registry_for_task,
+            sink_for_task,
+            observers_for_task,
+            ssh_state_for_task,
+            id_for_task,
+            initial,
+            output_rx,
+            exit_rx,
+            auto_reconnect,
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ssh_supervisor(
+    registry: Arc<PtyRegistry>,
+    sink: Arc<dyn EventSink>,
+    observers: Vec<Arc<dyn PaneOutputSink>>,
+    ssh_state: Arc<SshState>,
+    id: String,
+    initial_cfg: SshConnectConfig,
+    initial_output_rx: mpsc::Receiver<Vec<u8>>,
+    initial_exit_rx: oneshot::Receiver<ExitStatus>,
+    auto_reconnect: bool,
+) {
+    let reconnect_notify = ssh_state.slot(&id);
+    let mut current_rx = Some((initial_output_rx, initial_exit_rx));
+    let cfg = initial_cfg;
+
+    // The exit status we eventually hand to `finalize_pane_exit`. Holds the
+    // *real* status the user should see in the UI — clean shell logout,
+    // user kill, or "all retries exhausted" sentinel.
+    let final_status: Option<ExitStatus>;
+
+    'outer: loop {
+        let (output_rx, exit_rx) = current_rx.take().expect("rx pair present");
+        let exit =
+            drain_until_exit(sink.as_ref(), observers.as_slice(), &id, output_rx, exit_rx).await;
+
+        let user_kill = ssh_state.is_shutdown(&id);
+        // SshSession::pump marks user-initiated kills with `success: true`;
+        // network disconnects come back as `success: false` (typically
+        // `code = u32::MAX`). A `success: true` exit from the remote shell
+        // (user typed `exit`) is also treated as final.
+        let clean = exit.map(|s| s.success).unwrap_or(false);
+
+        if !auto_reconnect || clean || user_kill {
+            final_status = exit;
+            break;
+        }
+
+        // Disconnect → reconnect. Crucially: do *not* fire `on_exit`
+        // observers or emit `pty:exit` here. The pane is logically still
+        // alive; the frontend's `currentPtyId` must stay attached so the
+        // upcoming `ssh:status` / `pty:data` events route correctly.
+        sink.emit_ssh_status(&id, SshStatus::Disconnected, 0);
+
+        let mut policy = BackoffPolicy::default().iter();
+        while let Some((attempt, delay)) = policy.next_attempt() {
+            sink.emit_ssh_status(&id, SshStatus::Reconnecting, attempt);
+            // Wake either when the backoff elapses or when the user clicks
+            // Reconnect — the latter is also how `signal_shutdown` reaches
+            // us, in which case `is_shutdown()` returns true below.
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = reconnect_notify.notified() => {}
+            }
+            if ssh_state.is_shutdown(&id) {
+                // User closed the pane during the wait. No reconnect, no
+                // synthetic exit emit — the kill path already removed the
+                // registry entry and pty:exit fires once below.
+                final_status = Some(ExitStatus {
+                    code: 0,
+                    success: true,
+                });
+                break 'outer;
+            }
+            sink.emit_ssh_status(&id, SshStatus::Connecting, attempt);
+            match SshSession::connect(cfg.clone()).await {
+                Ok(mut session) => {
+                    let new_output = session.take_output_rx().expect("output rx present");
+                    let new_exit = session.take_exit_rx().expect("exit rx present");
+                    if let Err(e) = registry.swap_ssh(&id, session) {
+                        // Most likely cause: the entry was removed by a
+                        // concurrent `pty_kill`. Treat that as a clean
+                        // shutdown — the user wanted this pane gone.
+                        eprintln!("relay-ssh: swap_ssh for {id} failed: {e}");
+                        final_status = Some(ExitStatus {
+                            code: 0,
+                            success: true,
+                        });
+                        break 'outer;
+                    }
+                    sink.emit_ssh_status(&id, SshStatus::Connected, attempt);
+                    current_rx = Some((new_output, new_exit));
+                    continue 'outer;
+                }
+                Err(e) => {
+                    eprintln!("relay-ssh: reconnect attempt {attempt} failed: {e}");
+                }
+            }
+        }
+
+        // All attempts exhausted — finalize with a non-success exit so the
+        // frontend leaves the reconnecting state and the pane settles into
+        // "exited".
+        final_status = Some(ExitStatus {
+            code: u32::MAX,
+            success: false,
+        });
+        break;
+    }
+
+    if let Some(status) = final_status {
+        finalize_pane_exit(sink.as_ref(), observers.as_slice(), &id, status);
+    }
+    let _ = registry.take(&id);
+    ssh_state.drop_slot(&id);
 }
 
 async fn forward_loop(
@@ -393,18 +843,145 @@ async fn forward_loop(
 #[tauri::command]
 pub async fn pty_spawn(
     state: State<'_, BridgeState>,
+    ssh_state: State<'_, Arc<SshState>>,
     config: PtySpawnConfig,
 ) -> Result<(), String> {
     let id = config.id.clone();
+    if let Some(ssh_cfg) = config.ssh.clone() {
+        let resolved =
+            resolve_ssh_connect(&ssh_cfg, config.cols, config.rows).map_err(|e| e.to_string())?;
+        let auto_reconnect = ssh_cfg.auto_reconnect;
+        return spawn_ssh(
+            state.registry.clone(),
+            state.sink.clone(),
+            state.observers.clone(),
+            ssh_state.inner().clone(),
+            id,
+            resolved,
+            auto_reconnect,
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
     spawn_pty(
         state.registry.clone(),
         state.sink.clone(),
         state.observers.clone(),
         id,
-        config.into(),
+        config.into_pty_config().map_err(|e| e.to_string())?,
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Resolve a frontend-supplied `SshSpawnConfig` against `~/.ssh/config` and
+/// Keychain to produce the concrete connect parameters russh needs.
+fn resolve_ssh_connect(
+    cfg: &SshSpawnConfig,
+    cols: u16,
+    rows: u16,
+) -> Result<SshConnectConfig, String> {
+    let default_user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+    let ssh_config_text = ssh_config_text();
+    let parsed = crate::ssh::SshConfig::parse(&ssh_config_text);
+    let target = parsed.resolve(
+        &crate::ssh::SshTargetOverride {
+            host: cfg.host.clone(),
+            port: cfg.port,
+            user: cfg.user.clone(),
+            identity_path: cfg.identity_path.clone(),
+            ssh_config_alias: cfg.ssh_config_alias.clone(),
+        },
+        &default_user,
+    );
+
+    let (lookup_user, lookup_host) = keychain_lookup_identity(cfg, &target);
+    let auth = build_ssh_auth(
+        &target,
+        &lookup_user,
+        &lookup_host,
+        cfg.use_keychain_password,
+    )?;
+    Ok(SshConnectConfig {
+        host: target.host,
+        port: target.port,
+        user: target.user,
+        auth,
+        cols,
+        rows,
+        term: "xterm-256color".into(),
+        ..Default::default()
+    })
+}
+
+/// Derive the (user, host) pair the Keychain entry is keyed under for an
+/// SSH pane.
+///
+/// The Keychain lookup key must be the *same* identifier the user typed into
+/// the storage UI — not the post-`~/.ssh/config`-resolution hostname. With
+/// `Host devbox / HostName devbox.internal`, the user stores under
+/// `alice@devbox` but `target.host` becomes `devbox.internal`; keying the
+/// lookup on `target.host` would miss every aliased pane. We therefore key
+/// on the alias (when given) or the literal host, and on the override user
+/// (when given) — falling back to the resolved user only because that's
+/// also what the storage UI shows as the default when the user leaves the
+/// field blank.
+///
+/// Pure / no I/O so a unit test can pin the contract without touching the
+/// real Keychain.
+pub(crate) fn keychain_lookup_identity(
+    cfg: &SshSpawnConfig,
+    target: &crate::ssh::ResolvedSshTarget,
+) -> (String, String) {
+    let host = cfg
+        .ssh_config_alias
+        .clone()
+        .unwrap_or_else(|| cfg.host.clone());
+    let user = cfg.user.clone().unwrap_or_else(|| target.user.clone());
+    (user, host)
+}
+
+fn ssh_config_text() -> String {
+    let path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
+    match path {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+fn build_ssh_auth(
+    target: &crate::ssh::ResolvedSshTarget,
+    lookup_user: &str,
+    lookup_host: &str,
+    use_keychain_password: bool,
+) -> Result<SshAuth, String> {
+    let account = crate::ssh::keychain::account_for(lookup_user, lookup_host);
+    let keychain_password = if use_keychain_password {
+        crate::ssh::keychain::get(&account).map_err(|e| format!("keychain lookup: {e}"))?
+    } else {
+        None
+    };
+    match (target.identity_path.as_ref(), keychain_password) {
+        // A single Keychain entry serves two roles: passphrase for an
+        // encrypted private key, *and* password fallback if the server
+        // refuses key auth. Without this, every encrypted key would fail
+        // (`load_secret_key(..., None)` can't decrypt) and the user would
+        // have to set up plaintext keys to get SSH panes working.
+        (Some(path), Some(secret)) => Ok(SshAuth::KeyOrPassword {
+            path: path.clone(),
+            passphrase: Some(secret.clone()),
+            password: secret,
+        }),
+        (Some(path), None) => Ok(SshAuth::Key {
+            path: path.clone(),
+            passphrase: None,
+        }),
+        (None, Some(password)) => Ok(SshAuth::Password(password)),
+        (None, None) => Err(format!(
+            "no SSH credentials for {} (set IdentityFile in ~/.ssh/config or store a password in Keychain)",
+            account
+        )),
+    }
 }
 
 #[tauri::command]
@@ -472,8 +1049,72 @@ pub fn pty_resize(
 }
 
 #[tauri::command]
-pub fn pty_kill(state: State<'_, BridgeState>, id: String) -> Result<(), String> {
+pub fn pty_kill(
+    state: State<'_, BridgeState>,
+    ssh_state: State<'_, Arc<SshState>>,
+    id: String,
+) -> Result<(), String> {
+    // For SSH panes, tell the supervisor we want a real teardown before the
+    // registry entry disappears. Without this, a kill issued while the
+    // supervisor is in its backoff sleep would race: the supervisor would
+    // wake, attempt to connect, then fail `swap_ssh` because the entry was
+    // already taken — emitting a useless "reconnecting" flash along the way.
+    if state.registry.get_ssh(&id).is_some() {
+        ssh_state.signal_shutdown(&id);
+    }
     state.registry.kill(&id).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// SSH commands
+// ---------------------------------------------------------------------------
+
+/// Force an immediate reconnect attempt for an SSH pane. The supervisor's
+/// backoff timer is interrupted via a Notify; if the pane isn't currently in
+/// the reconnect loop the signal is a no-op (the supervisor will still pick
+/// it up on the next disconnect).
+#[tauri::command]
+pub fn ssh_reconnect(ssh_state: State<'_, Arc<SshState>>, id: String) -> Result<(), String> {
+    ssh_state.signal_reconnect(&id);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshHostAlias {
+    pub alias: String,
+}
+
+/// Aliases from `~/.ssh/config` for the settings GUI dropdown.
+#[tauri::command]
+pub fn ssh_config_hosts() -> Result<Vec<SshHostAlias>, String> {
+    let parsed = crate::ssh::SshConfig::parse(&ssh_config_text());
+    Ok(parsed
+        .aliases()
+        .into_iter()
+        .map(|alias| SshHostAlias { alias })
+        .collect())
+}
+
+/// Store a password / passphrase in the macOS Keychain under
+/// `service = "relay-ssh"`, `account = "<user>@<host>"`. The plaintext never
+/// leaves Rust; only `ssh_keychain_has` is provided for read-side checks.
+#[tauri::command]
+pub fn ssh_keychain_set(user: String, host: String, password: String) -> Result<(), String> {
+    let account = crate::ssh::keychain::account_for(&user, &host);
+    crate::ssh::keychain::set(&account, &password)
+}
+
+#[tauri::command]
+pub fn ssh_keychain_has(user: String, host: String) -> Result<bool, String> {
+    let account = crate::ssh::keychain::account_for(&user, &host);
+    Ok(crate::ssh::keychain::has(&account))
+}
+
+#[tauri::command]
+pub fn ssh_keychain_delete(user: String, host: String) -> Result<(), String> {
+    let account = crate::ssh::keychain::account_for(&user, &host);
+    crate::ssh::keychain::delete(&account)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,9 +1127,26 @@ mod tests {
     use std::time::Instant;
 
     #[derive(Debug, Clone)]
+    // The bridge unit tests don't currently assert on captured `SshStatus`
+    // events — the supervisor's status/exit ordering is exercised end-to-end
+    // by the integration test (`supervisor_treats_user_kill_as_clean_shutdown`).
+    // The variant exists here so test sinks can faithfully record the event
+    // stream without the production code paying a runtime cost.
+    #[allow(dead_code)]
     enum TestEvent {
-        Data { pane_id: String, data: Vec<u8> },
-        Exit { pane_id: String, status: ExitStatus },
+        Data {
+            pane_id: String,
+            data: Vec<u8>,
+        },
+        Exit {
+            pane_id: String,
+            status: ExitStatus,
+        },
+        SshStatus {
+            pane_id: String,
+            status: SshStatus,
+            attempt: u32,
+        },
     }
 
     #[derive(Default)]
@@ -530,6 +1188,14 @@ mod tests {
             self.events.lock().unwrap().push(TestEvent::Exit {
                 pane_id: pane_id.to_string(),
                 status,
+            });
+        }
+
+        fn emit_ssh_status(&self, pane_id: &str, status: SshStatus, attempt: u32) {
+            self.events.lock().unwrap().push(TestEvent::SshStatus {
+                pane_id: pane_id.to_string(),
+                status,
+                attempt,
             });
         }
     }
@@ -581,9 +1247,8 @@ mod tests {
         );
 
         // The registry entry is cleaned up once the forward task finishes.
-        let inner = registry.inner.lock().unwrap();
         assert!(
-            !inner.ptys.contains_key(&id),
+            !registry.contains(&id),
             "registry should drop completed pane {id}"
         );
     }
@@ -720,7 +1385,7 @@ mod tests {
         .await
         .expect("spawn B");
 
-        let pty_a = registry.get(&a).expect("pane A in registry");
+        let pty_a = registry.get_pty(&a).expect("pane A in registry");
         let guard_a = pty_a.lock().expect("lock A");
 
         // Sanity: write on A is blocked while the inner mutex is held.
@@ -1026,7 +1691,7 @@ mod tests {
                 self.registry_known_at_exit
                     .lock()
                     .unwrap()
-                    .push((pane_id.to_string(), reg.get(pane_id).is_some()));
+                    .push((pane_id.to_string(), reg.contains(pane_id)));
             }
             self.exits
                 .lock()
@@ -1122,8 +1787,108 @@ mod tests {
         // Sanity: by the time the frontend sees pty:exit the registry IS
         // emptied.
         assert!(
-            registry.get(&id).is_none(),
+            !registry.contains(&id),
             "registry should drop the source pane after exit is fully processed"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Keychain account-key derivation
+    //
+    // Pins the contract that the lookup key matches the *user-facing*
+    // identifier — what they typed into the storage UI — rather than the
+    // post-ssh_config-resolution hostname. A regression here silently
+    // bypasses every aliased SSH pane's stored password.
+    // -----------------------------------------------------------------
+
+    fn default_target(user: &str, host: &str) -> crate::ssh::ResolvedSshTarget {
+        crate::ssh::ResolvedSshTarget {
+            host: host.to_string(),
+            port: 22,
+            user: user.to_string(),
+            identity_path: None,
+        }
+    }
+
+    fn ssh_spawn_cfg(host: &str) -> SshSpawnConfig {
+        SshSpawnConfig {
+            host: host.into(),
+            port: None,
+            user: None,
+            identity_path: None,
+            ssh_config_alias: None,
+            use_keychain_password: false,
+            auto_reconnect: true,
+        }
+    }
+
+    #[test]
+    fn keychain_lookup_uses_alias_not_resolved_hostname() {
+        // The user stored the password under `alice@devbox` via the storage
+        // UI. The pane spec carries `ssh_config_alias = "devbox"` and the
+        // alias resolves to `HostName devbox.internal.example.com`. The
+        // lookup must still key on `devbox`, otherwise no password would
+        // ever match for aliased panes.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        let target = default_target("alice", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(
+            host, "devbox",
+            "lookup host must match the alias the user stored under, not the resolved HostName"
+        );
+    }
+
+    #[test]
+    fn keychain_lookup_uses_literal_host_when_no_alias() {
+        // Direct-host pane (no alias). User stored under
+        // `alice@10.0.0.1`; ssh_config may or may not have a wildcard
+        // entry but it shouldn't change the lookup identifier.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ..ssh_spawn_cfg("10.0.0.1")
+        };
+        let target = default_target("alice", "10.0.0.1");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(host, "10.0.0.1");
+    }
+
+    #[test]
+    fn keychain_lookup_user_override_wins_over_resolved_user() {
+        // If the pane spec specifies a user, the lookup must use it even
+        // when ssh_config's `User` block would resolve to something else.
+        // Otherwise a single host with multiple Keychain entries (per OS
+        // user) wouldn't be addressable.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        // ssh_config resolved to a different user (e.g. `User bob` in the
+        // Host block). We must still look up alice.
+        let target = default_target("bob", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(host, "devbox");
+    }
+
+    #[test]
+    fn keychain_lookup_falls_back_to_resolved_user_when_no_override() {
+        // No `user` in the pane spec — the storage UI would show the
+        // default OS user (the same `default_user` ssh_config falls back
+        // to), so the lookup uses that too.
+        let cfg = SshSpawnConfig {
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        let target = default_target("default-user", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "default-user");
+        assert_eq!(host, "devbox");
     }
 }
