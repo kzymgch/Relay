@@ -74,19 +74,37 @@ Rust (run inside `src-tauri/`):
 ## Building distributables
 
 ```bash
-pnpm tauri build
+pnpm tauri build --target aarch64-apple-darwin
 ```
 
-Outputs land in `src-tauri/target/release/bundle/`:
+Outputs land in `src-tauri/target/aarch64-apple-darwin/release/bundle/`:
 
 - `macos/Relay.app` — application bundle (directory)
 - `dmg/Relay_<version>_aarch64.dmg` — installer image
+
+`tauri.conf.json` pins `bundle.targets` to `["dmg","app"]` so no other formats
+are produced, and `macOS.minimumSystemVersion: "12.0"` matches the macOS 12
+Monterey baseline.
 
 **Releases** publish the `.dmg` directly. The `.app` bundle is a directory and
 cannot be uploaded as-is — zip it with `ditto` if you need to attach it:
 
 ```bash
 ditto -c -k --sequesterRsrc --keepParent Relay.app Relay-app.zip
+```
+
+### Cutting a release
+
+`.github/workflows/release.yml` runs on every `vX.Y.Z` tag push and on a manual
+`workflow_dispatch` (a dropdown that accepts a tag name for dry-runs). It runs
+`pnpm tauri build` on `macos-14`, zips the `.app` with `ditto`, and creates a
+**draft** GitHub Release for the tag with the `.dmg` and `.app.zip` attached.
+Review the draft in the GitHub UI, then publish.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# → check the draft release on https://github.com/<org>/<repo>/releases
 ```
 
 ### Gatekeeper on first launch
