@@ -10,6 +10,7 @@ import type { LayoutStore } from "../layout/store.svelte";
 import type { RelayConfig } from "../config";
 import type { PipeRule } from "../pipe";
 import type { SessionMetadata } from "../sessions";
+import { sshReconnect } from "../ssh";
 
 export type PaletteGroup =
   | "pane"
@@ -103,6 +104,15 @@ export function buildActions(input: BuildActionsInput): PaletteAction[] {
       hint: id === focusedId ? "(current)" : undefined,
       run: () => store.focus(id),
     });
+    if (spec.ssh) {
+      out.push({
+        id: `pane.ssh.reconnect.${id}`,
+        label: `Reconnect SSH: ${spec.label}`,
+        group: "pane",
+        hint: spec.ssh.host,
+        run: () => sshReconnect(id).catch(() => undefined),
+      });
+    }
   }
   if (focused) {
     out.push({

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Multi-pane terminal app for orchestrating CLIs side-by-side."
 authors = ["Relay contributors"]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,6 +33,11 @@ regex = "1"
 strip-ansi-escapes = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 arc-swap = "1"
+russh = "0.61"
+security-framework = "3.7"
+async-trait = "0.1"
 
 [dev-dependencies]
+bytes = "1.11.1"
+rand = "0.10.1"
 tempfile = "3"

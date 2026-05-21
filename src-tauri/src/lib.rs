@@ -5,12 +5,13 @@ pub mod paths;
 pub mod pipe;
 pub mod pty;
 pub mod session;
+pub mod ssh;
 
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
 
-use bridge::{BridgeState, PaneOutputSink, PtyRegistry, TauriEventSink};
+use bridge::{BridgeState, PaneOutputSink, PtyRegistry, SshState, TauriEventSink};
 use config::ConfigStore;
 use log::{CompiledLogConfig, LogRegistry};
 use pipe::{PipeRegistry, TauriPipeEventSink};
@@ -85,6 +86,9 @@ pub fn run() {
             ));
             app.manage(session_store);
 
+            // SSH reconnect coordinator state (per-pane Notify slots).
+            app.manage(Arc::new(SshState::new()));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -115,6 +119,11 @@ pub fn run() {
             pipe::pipe_delete,
             pipe::pipe_toggle,
             pipe::pipe_replace_all,
+            bridge::ssh_reconnect,
+            bridge::ssh_config_hosts,
+            bridge::ssh_keychain_set,
+            bridge::ssh_keychain_has,
+            bridge::ssh_keychain_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

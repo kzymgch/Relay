@@ -41,6 +41,7 @@ export interface NewPaneInput {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  ssh?: PaneSpec["ssh"];
 }
 
 export interface LayoutStore {
@@ -236,6 +237,7 @@ export function createLayoutStore(
       ...(input?.args !== undefined && { args: input.args }),
       ...(input?.cwd !== undefined && { cwd: input.cwd }),
       ...(input?.env !== undefined && { env: input.env }),
+      ...(input?.ssh !== undefined && { ssh: input.ssh }),
     };
   }
 
@@ -295,10 +297,11 @@ export function createLayoutStore(
       const spec: PaneSpec = {
         id: newId,
         label: `${source.label} (copy)`,
-        command: source.command,
+        ...(source.command !== undefined && { command: source.command }),
         ...(source.args !== undefined && { args: source.args }),
         ...(source.cwd !== undefined && { cwd: source.cwd }),
         ...(source.env !== undefined && { env: source.env }),
+        ...(source.ssh !== undefined && { ssh: { ...source.ssh } }),
       };
       const nextTree = duplicatePaneTree(tree, targetPaneId, newId, direction, ids.split());
       tree = nextTree;

@@ -3,6 +3,21 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type PaneId = string;
 
+export interface SshSpawnConfig {
+  host: string;
+  port?: number;
+  user?: string;
+  identityPath?: string;
+  sshConfigAlias?: string;
+  /** When true, the backend looks up the password by `<user>@<host>` in the
+   *  macOS Keychain (service `relay-ssh`). Plaintext passwords never traverse
+   *  this IPC boundary. */
+  useKeychainPassword?: boolean;
+  /** Default: `true`. When `false`, an unexpected disconnect surfaces as
+   *  `pty:exit` instead of triggering the supervisor's backoff loop. */
+  autoReconnect?: boolean;
+}
+
 export interface PtySpawnConfig {
   /**
    * JS-allocated pane id. The frontend subscribes to `pty:data` / `pty:exit`
@@ -11,12 +26,17 @@ export interface PtySpawnConfig {
    * returning are routed correctly. The backend rejects duplicate ids.
    */
   id: PaneId;
-  command: string;
+  /** Local command. Required for local panes; ignored when `ssh` is set. */
+  command?: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
   cols?: number;
   rows?: number;
+  /** When present, the backend opens an SSH session against the remote and
+   *  streams its login shell through the same `pty:data` / `pty:exit` events
+   *  used for local PTYs. */
+  ssh?: SshSpawnConfig;
 }
 
 export interface PtyDataPayload {

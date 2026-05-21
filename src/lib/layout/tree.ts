@@ -41,13 +41,32 @@ export interface SplitNode {
 
 export type LayoutNode = LeafNode | SplitNode;
 
+/** SSH connection parameters for a remote pane. Only `host` is required; the
+ *  rest fall back to `~/.ssh/config` lookup at connect time, then to defaults
+ *  (port 22, current OS user). Passwords are not stored here — set
+ *  `useKeychainPassword` and store the secret via `ssh_keychain_set`. */
+export interface SshTarget {
+  host: string;
+  port?: number;
+  user?: string;
+  identityPath?: string;
+  sshConfigAlias?: string;
+  useKeychainPassword?: boolean;
+  /** When false, disconnect drops the pane to `exited`; when true (default),
+   *  the backend retries with exponential backoff. */
+  autoReconnect?: boolean;
+}
+
 export interface PaneSpec {
   id: PaneId;
   label: string;
-  command: string;
+  /** Local command. Required for local panes; ignored when `ssh` is set. */
+  command?: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  /** When present, this pane is a remote SSH pane. */
+  ssh?: SshTarget;
 }
 
 export interface LayoutSnapshot {
