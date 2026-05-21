@@ -16,6 +16,12 @@ export interface TerminalApi {
   serialize(): string;
   findNext(query: string): boolean;
   findPrevious(query: string): boolean;
+  /**
+   * The user-selected text in the terminal, or `undefined` when there is no
+   * selection. Used by PR-08 inter-pane send to pull the source text without
+   * forcing the user to copy it first.
+   */
+  getSelection(): string | undefined;
   readonly cols: number;
   readonly rows: number;
 }

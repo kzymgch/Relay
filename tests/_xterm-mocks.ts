@@ -34,6 +34,11 @@ class MockTerminal {
   clear = vi.fn();
   focus = vi.fn();
 
+  // Tests can drive selection state by mutating this field directly. The
+  // empty default matches xterm's real "no selection" return value.
+  selection = "";
+  getSelection = vi.fn(() => this.selection);
+
   paste = vi.fn((data: string) => {
     for (const cb of state.dataHandlers) cb(data);
   });

@@ -462,6 +462,109 @@ describe("Pane component", () => {
     });
   });
 
+  it("right-click with a selection opens the Send-to menu listing targets", async () => {
+    const onSelect = vi.fn();
+    const { container } = await mountPane({
+      sendTargets: [
+        { label: "Pane 2", onSelect },
+        { label: "Pane 3", onSelect: vi.fn() },
+      ],
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    // Selection has to be non-empty for the menu to appear — the right-click
+    // otherwise falls through to native (devtools / browser default).
+    getXtermState().instances.at(-1)!.selection = "ls";
+
+    const paneEl = container.querySelector(".pane") as HTMLElement;
+    await fireEvent.contextMenu(paneEl, { clientX: 10, clientY: 20 });
+
+    const menu = container.querySelector('[data-testid="pane-send-menu"]');
+    expect(menu).not.toBeNull();
+    const items = Array.from(menu!.querySelectorAll("button")).map((b) => b.textContent);
+    expect(items).toEqual(["Pane 2", "Pane 3"]);
+  });
+
+  it("right-click with no selection does not open the menu", async () => {
+    const { container } = await mountPane({
+      sendTargets: [{ label: "Pane 2", onSelect: vi.fn() }],
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    // Default mock selection is empty.
+    const paneEl = container.querySelector(".pane") as HTMLElement;
+    await fireEvent.contextMenu(paneEl, { clientX: 10, clientY: 20 });
+    expect(container.querySelector('[data-testid="pane-send-menu"]')).toBeNull();
+  });
+
+  it("clicking a Send-to entry invokes the target's callback", async () => {
+    const sendToPane2 = vi.fn();
+    const { container } = await mountPane({
+      sendTargets: [{ label: "Pane 2", onSelect: sendToPane2 }],
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    getXtermState().instances.at(-1)!.selection = "ls -la";
+
+    const paneEl = container.querySelector(".pane") as HTMLElement;
+    await fireEvent.contextMenu(paneEl, { clientX: 10, clientY: 20 });
+
+    const target = container.querySelector(
+      '[data-testid="pane-send-menu"] button'
+    ) as HTMLButtonElement;
+    await fireEvent.click(target);
+    expect(sendToPane2).toHaveBeenCalledTimes(1);
+    // Menu dismisses after the pick so a second contextmenu still works.
+    expect(container.querySelector('[data-testid="pane-send-menu"]')).toBeNull();
+  });
+
+  it("handle.getPtyId returns undefined after pty:exit", async () => {
+    // Inter-pane send (PR-08 AppRoot.sendSelection) calls handle.getPtyId
+    // at the moment of the send; a stale id would reach pty_send_text and
+    // the bridge would reject it as "unknown pty id". Once the child has
+    // exited the handle must surface "no live pty" so the caller no-ops.
+    const onregister = vi.fn();
+    const { container } = await mountPane({ onregister });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const handle = onregister.mock.calls.at(-1)?.[0];
+    expect(handle?.getPtyId()).toBe("pane-1");
+
+    emitTauriEvent("pty:exit", { paneId: "pane-1", code: 0, success: true });
+
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-exited")).not.toBeNull();
+    });
+    expect(handle?.getPtyId()).toBeUndefined();
+  });
+
+  it("registers a handle on mount and unregisters on unmount", async () => {
+    const onregister = vi.fn();
+    const { unmount } = await mountPane({ onregister });
+    // Most recent registration call is the live handle.
+    await vi.waitFor(() => {
+      expect(onregister).toHaveBeenCalled();
+    });
+    const handle = onregister.mock.calls.at(-1)?.[0];
+    expect(handle).toBeDefined();
+    expect(handle.label).toBe("Pane A");
+    expect(typeof handle.getPtyId).toBe("function");
+    expect(typeof handle.getSelection).toBe("function");
+
+    // The handle reads through to xterm's selection at call time.
+    getXtermState().instances.at(-1)!.selection = "hello";
+    expect(handle.getSelection()).toBe("hello");
+
+    unmount();
+    // Last call after unmount must clear the handle so the parent doesn't
+    // hold a dangling reference.
+    expect(onregister.mock.calls.at(-1)?.[0]).toBeUndefined();
+  });
+
   it("focuses the terminal when mounted with focused=true", async () => {
     // The initial layout starts with one pane already selected; that pane
     // should not require a click to capture keystrokes.

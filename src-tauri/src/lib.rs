@@ -29,6 +29,7 @@ pub fn run() {
             bridge::pty_write,
             bridge::pty_resize,
             bridge::pty_kill,
+            bridge::pty_send_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

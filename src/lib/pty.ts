@@ -49,6 +49,26 @@ export async function killPty(id: PaneId): Promise<void> {
   await invoke("pty_kill", { id });
 }
 
+/**
+ * Send text to a pane's PTY with bracketed-paste framing and an optional
+ * trailing newline. The Rust side builds the wire payload (`build_send_payload`
+ * in `bridge.rs`) so the wrapping policy stays in one place and is
+ * Rust-tested.
+ */
+export async function sendPtyText(
+  id: PaneId,
+  text: string,
+  bracketedPaste: boolean,
+  trailingNewline: boolean
+): Promise<void> {
+  await invoke("pty_send_text", {
+    id,
+    text,
+    bracketedPaste,
+    trailingNewline,
+  });
+}
+
 /** Convert the on-the-wire `pty:data` payload into a typed view. */
 export function parsePtyData(payload: PtyDataPayload): { paneId: PaneId; data: Uint8Array } {
   return { paneId: payload.paneId, data: new Uint8Array(payload.data) };

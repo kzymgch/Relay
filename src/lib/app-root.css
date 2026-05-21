@@ -1,0 +1,35 @@
+/* Global app shell + 3-pane grid. Mirrors `relay-spec.md §5` "三画面"
+ * preset (left full-height, right column split into two). Future
+ * PR-10/-13 will replace this fixed grid with the tree layout model. */
+
+/* Split rather than `:global(html, body)`: esbuild's CSS minifier warns on
+ * the combined form (it can't rewrite the comma-separated selector while
+ * preserving the `:global` scope contract). */
+:global(html),
+:global(body) {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100vw;
+  background: #000;
+  color: #f6f6f6;
+  overflow: hidden;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  grid-template-areas:
+    "left topRight"
+    "left bottomRight";
+  height: 100vh;
+  width: 100vw;
+  gap: 2px;
+  background: #000;
+}
+
+.slot {
+  min-width: 0;
+  min-height: 0;
+}

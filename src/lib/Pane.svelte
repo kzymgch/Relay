@@ -17,6 +17,26 @@
 
   type PaneStatus = "spawning" | "running" | "exited" | "error";
 
+  /**
+   * Handle the parent uses to read a pane's live state without forcing the
+   * pane to leak `currentPtyId` as a reactive. The parent calls these at the
+   * moment of action (Cmd+Shift+N, context-menu pick) — there's no need for
+   * Svelte fine-grained reactivity here.
+   */
+  export interface PaneHandle {
+    label: string;
+    /** Current PTY id, or `undefined` while spawning / after exit. */
+    getPtyId(): string | undefined;
+    /** Selected text in the embedded xterm, or `undefined` when nothing is selected. */
+    getSelection(): string | undefined;
+  }
+
+  /** A "Send to" entry rendered in the pane's right-click menu. */
+  export interface PaneSendTarget {
+    label: string;
+    onSelect: () => void;
+  }
+
   interface Props {
     label: string;
     command: string;
@@ -30,14 +50,38 @@
      * PR-12 (`feat/pane-ops`).
      */
     onclose?: () => void;
+    /**
+     * Send-to targets the parent populates with the other panes. When
+     * undefined / empty, the right-click menu is suppressed entirely so the
+     * native context menu still works in dev tooling scenarios.
+     */
+    sendTargets?: PaneSendTarget[];
+    /**
+     * Called on mount (with a live handle) and on unmount (with `undefined`).
+     * Parents use the handle for keybindings (`Cmd+Shift+1..N`) and the
+     * command palette without coupling to internal pane state.
+     */
+    onregister?: (handle: PaneHandle | undefined) => void;
   }
 
-  let { label, command, args = [], cwd, env, focused = false, onfocus, onclose }: Props = $props();
+  let {
+    label,
+    command,
+    args = [],
+    cwd,
+    env,
+    focused = false,
+    onfocus,
+    onclose,
+    sendTargets = [],
+    onregister,
+  }: Props = $props();
 
   let status: PaneStatus = $state("spawning");
   let exitInfo: { code: number; success: boolean } | null = $state(null);
   let errorMessage: string | undefined = $state();
   let api: TerminalApi | undefined = $state();
+  let menu: { x: number; y: number } | null = $state(null);
 
   // Non-reactive bookkeeping. `currentPtyId` is the id our listeners route to
   // right now; clearing it instantly detaches the listeners from any
@@ -70,6 +114,12 @@
       if (id === currentPtyId) {
         status = "exited";
         exitInfo = { code, success };
+        // Clear the live id so PaneHandle.getPtyId() returns undefined per
+        // its contract. AppRoot's inter-pane send relies on this to cleanly
+        // no-op when the target pane has exited — otherwise the stale id
+        // would reach pty_send_text and the bridge would reject it as
+        // "unknown pty id".
+        currentPtyId = undefined;
       }
     });
     if (destroyed) {
@@ -206,9 +256,39 @@
     }
   });
 
+  function handleContextMenu(event: MouseEvent) {
+    if (sendTargets.length === 0) return;
+    // If there's no selection there's nothing to send; let the native menu
+    // through so the user can still copy / paste etc.
+    const selection = api?.getSelection();
+    if (!selection) return;
+    event.preventDefault();
+    menu = { x: event.clientX, y: event.clientY };
+  }
+
+  function pickTarget(target: PaneSendTarget) {
+    menu = null;
+    target.onSelect();
+  }
+
+  function dismissMenu() {
+    menu = null;
+  }
+
   onMount(() => {
+    const handle: PaneHandle = {
+      // Captured by closure so callers always see the latest values without
+      // the parent needing to subscribe to pane internals.
+      get label() {
+        return label;
+      },
+      getPtyId: () => currentPtyId,
+      getSelection: () => api?.getSelection(),
+    };
+    onregister?.(handle);
     return () => {
       destroyed = true;
+      onregister?.(undefined);
       unlistenData?.();
       unlistenExit?.();
       unlistenData = undefined;
@@ -229,7 +309,7 @@
      the terminal, and PR-09 adds Cmd+1..N. -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="pane" class:focused onclick={handleFocusRequest}>
+<div class="pane" class:focused onclick={handleFocusRequest} oncontextmenu={handleContextMenu}>
   <header class="pane-header">
     <span class="label">{label}</span>
     <span class="status status-{status}" data-testid="pane-status">
@@ -264,4 +344,28 @@
     {/if}
     <Terminal onready={handleTerminalReady} ondata={handleData} onresize={handleResize} />
   </div>
+
+  {#if menu}
+    <!-- Backdrop dismisses on click; the menu itself stops propagation so
+         choosing a target doesn't immediately close before the handler fires. -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="pane-menu-backdrop" onclick={dismissMenu}>
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <ul
+        class="pane-menu"
+        data-testid="pane-send-menu"
+        style="left: {menu.x}px; top: {menu.y}px"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <li class="pane-menu-header">Send to</li>
+        {#each sendTargets as target (target.label)}
+          <li>
+            <button type="button" onclick={() => pickTarget(target)}>{target.label}</button>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 </div>
