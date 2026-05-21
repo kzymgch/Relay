@@ -895,7 +895,13 @@ fn resolve_ssh_connect(
         &default_user,
     );
 
-    let auth = build_ssh_auth(&target, cfg.use_keychain_password)?;
+    let (lookup_user, lookup_host) = keychain_lookup_identity(cfg, &target);
+    let auth = build_ssh_auth(
+        &target,
+        &lookup_user,
+        &lookup_host,
+        cfg.use_keychain_password,
+    )?;
     Ok(SshConnectConfig {
         host: target.host,
         port: target.port,
@@ -908,6 +914,33 @@ fn resolve_ssh_connect(
     })
 }
 
+/// Derive the (user, host) pair the Keychain entry is keyed under for an
+/// SSH pane.
+///
+/// The Keychain lookup key must be the *same* identifier the user typed into
+/// the storage UI — not the post-`~/.ssh/config`-resolution hostname. With
+/// `Host devbox / HostName devbox.internal`, the user stores under
+/// `alice@devbox` but `target.host` becomes `devbox.internal`; keying the
+/// lookup on `target.host` would miss every aliased pane. We therefore key
+/// on the alias (when given) or the literal host, and on the override user
+/// (when given) — falling back to the resolved user only because that's
+/// also what the storage UI shows as the default when the user leaves the
+/// field blank.
+///
+/// Pure / no I/O so a unit test can pin the contract without touching the
+/// real Keychain.
+pub(crate) fn keychain_lookup_identity(
+    cfg: &SshSpawnConfig,
+    target: &crate::ssh::ResolvedSshTarget,
+) -> (String, String) {
+    let host = cfg
+        .ssh_config_alias
+        .clone()
+        .unwrap_or_else(|| cfg.host.clone());
+    let user = cfg.user.clone().unwrap_or_else(|| target.user.clone());
+    (user, host)
+}
+
 fn ssh_config_text() -> String {
     let path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     match path {
@@ -918,9 +951,11 @@ fn ssh_config_text() -> String {
 
 fn build_ssh_auth(
     target: &crate::ssh::ResolvedSshTarget,
+    lookup_user: &str,
+    lookup_host: &str,
     use_keychain_password: bool,
 ) -> Result<SshAuth, String> {
-    let account = crate::ssh::keychain::account_for(&target.user, &target.host);
+    let account = crate::ssh::keychain::account_for(lookup_user, lookup_host);
     let keychain_password = if use_keychain_password {
         crate::ssh::keychain::get(&account).map_err(|e| format!("keychain lookup: {e}"))?
     } else {
@@ -1755,5 +1790,105 @@ mod tests {
             !registry.contains(&id),
             "registry should drop the source pane after exit is fully processed"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Keychain account-key derivation
+    //
+    // Pins the contract that the lookup key matches the *user-facing*
+    // identifier — what they typed into the storage UI — rather than the
+    // post-ssh_config-resolution hostname. A regression here silently
+    // bypasses every aliased SSH pane's stored password.
+    // -----------------------------------------------------------------
+
+    fn default_target(user: &str, host: &str) -> crate::ssh::ResolvedSshTarget {
+        crate::ssh::ResolvedSshTarget {
+            host: host.to_string(),
+            port: 22,
+            user: user.to_string(),
+            identity_path: None,
+        }
+    }
+
+    fn ssh_spawn_cfg(host: &str) -> SshSpawnConfig {
+        SshSpawnConfig {
+            host: host.into(),
+            port: None,
+            user: None,
+            identity_path: None,
+            ssh_config_alias: None,
+            use_keychain_password: false,
+            auto_reconnect: true,
+        }
+    }
+
+    #[test]
+    fn keychain_lookup_uses_alias_not_resolved_hostname() {
+        // The user stored the password under `alice@devbox` via the storage
+        // UI. The pane spec carries `ssh_config_alias = "devbox"` and the
+        // alias resolves to `HostName devbox.internal.example.com`. The
+        // lookup must still key on `devbox`, otherwise no password would
+        // ever match for aliased panes.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        let target = default_target("alice", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(
+            host, "devbox",
+            "lookup host must match the alias the user stored under, not the resolved HostName"
+        );
+    }
+
+    #[test]
+    fn keychain_lookup_uses_literal_host_when_no_alias() {
+        // Direct-host pane (no alias). User stored under
+        // `alice@10.0.0.1`; ssh_config may or may not have a wildcard
+        // entry but it shouldn't change the lookup identifier.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ..ssh_spawn_cfg("10.0.0.1")
+        };
+        let target = default_target("alice", "10.0.0.1");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(host, "10.0.0.1");
+    }
+
+    #[test]
+    fn keychain_lookup_user_override_wins_over_resolved_user() {
+        // If the pane spec specifies a user, the lookup must use it even
+        // when ssh_config's `User` block would resolve to something else.
+        // Otherwise a single host with multiple Keychain entries (per OS
+        // user) wouldn't be addressable.
+        let cfg = SshSpawnConfig {
+            user: Some("alice".into()),
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        // ssh_config resolved to a different user (e.g. `User bob` in the
+        // Host block). We must still look up alice.
+        let target = default_target("bob", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "alice");
+        assert_eq!(host, "devbox");
+    }
+
+    #[test]
+    fn keychain_lookup_falls_back_to_resolved_user_when_no_override() {
+        // No `user` in the pane spec — the storage UI would show the
+        // default OS user (the same `default_user` ssh_config falls back
+        // to), so the lookup uses that too.
+        let cfg = SshSpawnConfig {
+            ssh_config_alias: Some("devbox".into()),
+            ..ssh_spawn_cfg("devbox")
+        };
+        let target = default_target("default-user", "devbox.internal.example.com");
+        let (user, host) = keychain_lookup_identity(&cfg, &target);
+        assert_eq!(user, "default-user");
+        assert_eq!(host, "devbox");
     }
 }
