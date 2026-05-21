@@ -37,6 +37,18 @@
     restart(): void;
     /** Open the in-pane search bar and focus its input (Cmd+F). */
     openSearch(): void;
+    /**
+     * Serialise the terminal buffer (ANSI sequences included). Used by
+     * session save when `config.scrollback.persistOnExit` is on. Returns
+     * an empty string when the terminal hasn't initialised yet.
+     */
+    serialize(): string;
+    /**
+     * Replay raw bytes into the terminal (no PTY round-trip). Used by
+     * session restore to bring back the previous run's scrollback before
+     * the new PTY starts producing output.
+     */
+    replay(bytes: Uint8Array): void;
   }
 
   /** A "Send to" entry rendered in the pane's right-click menu. */
@@ -62,9 +74,15 @@
     env?: Record<string, string>;
     /**
      * Per-app font size in CSS pixels. Owned by AppRoot so Cmd+/- adjusts
-     * every pane in lock-step; PR-18 will surface this in the settings GUI.
+     * every pane in lock-step; the settings GUI also writes here.
      */
     fontSize?: number;
+    /** Font family, threaded from `config.font.family`. */
+    fontFamily?: string;
+    /** xterm theme object (background / foreground / cursor / ANSI palette). */
+    terminalTheme?: import("@xterm/xterm").ITheme;
+    /** Scrollback buffer line count, threaded from `config.scrollback.lines`. */
+    scrollback?: number;
     focused?: boolean;
     onfocus?: () => void;
     /** Remove this pane (PR-12 / phase 3 wires `store.closePane`). */
@@ -122,6 +140,9 @@
     cwd,
     env,
     fontSize,
+    fontFamily,
+    terminalTheme,
+    scrollback,
     focused = false,
     onfocus,
     onclose,
@@ -461,6 +482,8 @@
         void restart();
       },
       openSearch,
+      serialize: () => api?.serialize() ?? "",
+      replay: (bytes: Uint8Array) => api?.write(bytes),
     };
     onregister?.(handle);
     return () => {
@@ -560,6 +583,9 @@
     {/if}
     <Terminal
       {fontSize}
+      {fontFamily}
+      theme={terminalTheme}
+      {scrollback}
       onready={handleTerminalReady}
       ondata={handleData}
       onresize={handleResize}

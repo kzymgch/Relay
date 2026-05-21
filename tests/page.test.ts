@@ -33,6 +33,9 @@ vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 vi.mock("../src/lib/terminal.css", () => ({}));
 vi.mock("../src/lib/pane.css", () => ({}));
 vi.mock("../src/lib/app-root.css", () => ({}));
+vi.mock("../src/lib/modal.css", () => ({}));
+vi.mock("../src/lib/palette/command-palette.css", () => ({}));
+vi.mock("../src/lib/settings/settings-panel.css", () => ({}));
 
 vi.mock("@tauri-apps/api/event", async () => {
   const mod = await import("./_tauri-event-mock");
@@ -478,6 +481,28 @@ describe("Page — inter-pane send", () => {
     });
     const spawns = invocations.filter((i) => i.cmd === "pty_spawn");
     expect(spawns).toHaveLength(1);
+  });
+
+  it("Cmd+P opens the command palette; Escape dismisses it", async () => {
+    const { container } = await mountPage();
+    expect(container.querySelector('[data-testid="command-palette"]')).toBeNull();
+    await fireEvent.keyDown(window, { key: "p", code: "KeyP", metaKey: true });
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="command-palette"]')).not.toBeNull();
+    });
+    // The input claims focus on open.
+    const input = container.querySelector(
+      '[data-testid="command-palette-input"]'
+    ) as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    // Escape from the backdrop dismisses it.
+    const backdrop = container.querySelector(
+      '[data-testid="command-palette-backdrop"]'
+    ) as HTMLElement;
+    await fireEvent.keyDown(backdrop, { key: "Escape" });
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="command-palette"]')).toBeNull();
+    });
   });
 
   it("right-click menu on pane 2 sends to pane 3 using pane 2's selection", async () => {

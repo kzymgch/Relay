@@ -6,14 +6,64 @@
   import { createLayoutStore } from "./layout/store.svelte";
   import { PRESETS, threePanePreset } from "./layout/presets";
   import Splitter from "./layout/Splitter.svelte";
-  import type { PaneId, SplitterInfo } from "./layout/tree";
+  import type { PaneId, PaneSpec, SplitterInfo } from "./layout/tree";
+  import { createConfigStore } from "./config.svelte";
+  import { onConfigChanged, type RelayConfig, type ThemeConfig } from "./config";
+  import type { ITheme } from "@xterm/xterm";
+  import {
+    clearAutosaveScrollback,
+    deleteSession as deleteSessionRust,
+    installAutosave,
+    listSessions,
+    loadSession as loadSessionRust,
+    readAutosave,
+    readAutosaveScrollback,
+    readSessionScrollback,
+    saveSession as saveSessionRust,
+    serializeSession,
+    writeAutosaveScrollback,
+    writeSessionScrollback,
+    type LayoutPayload,
+    type SessionMetadata,
+  } from "./sessions";
+  import CommandPalette from "./palette/CommandPalette.svelte";
+  import {
+    buildActions,
+    type PaletteAction,
+    type PaletteHooks,
+    type SettingsSection,
+  } from "./palette/actions";
+  import SettingsPanel from "./settings/SettingsPanel.svelte";
   import "./app-root.css";
   import "./layout/splitter.css";
+
+  // Config-driven default for newly-minted panes. Resolved lazily so the
+  // factory captures the *current* config snapshot — that way a user edit to
+  // `defaultPane.command` flows into the next split / preset growth without
+  // rebuilding the store.
+  function configDefaultPaneSpec(label: string, id: PaneId): PaneSpec {
+    const dp = config.current.defaultPane;
+    return {
+      id,
+      label,
+      command: dp.command,
+      ...(dp.args.length > 0 && { args: dp.args }),
+      ...(dp.cwd && { cwd: dp.cwd }),
+      ...(Object.keys(dp.env).length > 0 && { env: dp.env }),
+    };
+  }
+
+  // Config store comes first because the layout-store factory closes over
+  // `configDefaultPaneSpec`. Both attach asynchronously in `onMount` — see
+  // below — so the synchronous defaults here are just the boot state.
+  const config = createConfigStore();
 
   // Single source of truth for the layout tree, pane specs, and focus. The
   // store wraps the pure transforms in `./layout/tree.ts` and exposes derived
   // `paneOrder` (DFS) which drives Cmd+1..N + send target labelling.
-  const store = createLayoutStore(threePanePreset());
+  const store = createLayoutStore(threePanePreset(), {
+    defaultPaneSpec: configDefaultPaneSpec,
+  });
 
   const DEFAULT_FONT_SIZE = 13;
   const MIN_FONT_SIZE = 8;
@@ -46,8 +96,265 @@
   // change.
   const handles: Record<PaneId, PaneHandle> = {};
 
+  // Scrollback bytes recovered from a previous session, awaiting the moment
+  // the corresponding pane registers its handle. The replay path is one-way:
+  // we drain on registration so a later restart of the same pane doesn't
+  // re-inject stale history.
+  const pendingScrollback = new Map<PaneId, Uint8Array>();
+
   let sendOptions: SendOptions = $state({ ...DEFAULT_SEND_OPTIONS });
   const history = new SendHistory();
+
+  // Sync UI state ← config in two places, never via `$effect`:
+  //
+  //   1. Once after `config.attach()` resolves so the initial load
+  //      (`~/.config/relay/config.toml`) populates the form-controlled
+  //      values.
+  //   2. From the `config:changed` listener installed in onMount so an
+  //      external edit (hot reload) refreshes the same values.
+  //
+  // A reactive `$effect` on `config.current.*` would race with the
+  // optimistic local writes from Cmd+=/Cmd+-/Cmd+0: each handler bumps
+  // `fontSize` locally and then fires an async `config.update`. Between
+  // the local bump and the config write resolving, the effect would
+  // observe a stale `config.current.font.size` and snap `fontSize` back
+  // to it — visibly flickering, and outright dropping the second of two
+  // back-to-back Cmd+= presses.
+  function syncFromConfig(cfg: RelayConfig): void {
+    const targetFs = clampFontSize(cfg.font.size);
+    if (fontSize !== targetFs) fontSize = targetFs;
+    if (
+      sendOptions.bracketedPaste !== cfg.send.bracketedPaste ||
+      sendOptions.trailingNewline !== cfg.send.trailingNewline
+    ) {
+      sendOptions = {
+        bracketedPaste: cfg.send.bracketedPaste,
+        trailingNewline: cfg.send.trailingNewline,
+      };
+    }
+  }
+
+  /**
+   * Translate the user-facing `config.theme.mode` (`"dark"` | `"light"`) into
+   * an xterm `ITheme`. Kept minimal on purpose — full preset / custom palette
+   * support is intentionally out of scope here; this is only the wiring that
+   * makes the existing toggle actually take effect.
+   */
+  function themeFromConfig(theme: ThemeConfig): ITheme {
+    if (theme.mode === "light") {
+      return {
+        background: "#ffffff",
+        foreground: "#1a1a1a",
+        cursor: "#1a1a1a",
+        selectionBackground: "rgba(0, 0, 0, 0.15)",
+      };
+    }
+    return {
+      background: "#1f2125",
+      foreground: "#f5f5f5",
+      cursor: "#f5f5f5",
+      selectionBackground: "rgba(255, 255, 255, 0.2)",
+    };
+  }
+
+  // Derived xterm options. Re-computed on every config change because the
+  // hot-reload listener writes `config.current` and we want the Terminal
+  // component to pick up the new theme / family / scrollback without a
+  // restart.
+  const terminalTheme = $derived(themeFromConfig(config.current.theme));
+  const fontFamily = $derived(config.current.font.family);
+  const scrollback = $derived(config.current.scrollback.lines);
+
+  /**
+   * Persist a font-size change back to config so the next launch (and any
+   * other window) sees it. Fire-and-forget: the visible update already
+   * happened locally; the await is just for error logging.
+   */
+  function persistFontSize(size: number): void {
+    if (config.current.font.size === size) return;
+    void config
+      .update({ font: { ...config.current.font, size } })
+      .catch((e) => console.error("[app] persist font size failed", e));
+  }
+
+  /**
+   * Build the current SessionData blob from the layout + send options. Used
+   * both by autosave (visibilitychange / beforeunload) and Settings → Save
+   * named session.
+   */
+  function snapshotSession(name = "") {
+    const snap = store.exportSnapshot();
+    return serializeSession(
+      {
+        tree: snap.tree,
+        panes: snap.panes,
+        focusedPaneId: snap.focusedPaneId,
+        customLayouts: store.customLayouts,
+      },
+      sendOptions,
+      name
+    );
+  }
+
+  function applyLayoutPayload(layout: LayoutPayload): void {
+    store.importSnapshot({
+      tree: layout.tree,
+      panes: layout.panes,
+      focusedPaneId: layout.focusedPaneId,
+      customLayouts: layout.customLayouts,
+    });
+  }
+
+  /**
+   * Encode + persist scrollback for every live pane. Called from the
+   * autosave driver and from the palette's "Save session" action. Returns
+   * the list of pane ids that were actually written so callers can record
+   * them in `SessionData.scrollbackKeys`.
+   *
+   * When `persistOnExit` is OFF the function additionally wipes the
+   * autosave-scrollback dir — that way a user who toggles the setting off
+   * doesn't see ancient buffers reappear on the next restore.
+   */
+  async function persistScrollback(
+    write: (paneId: string, bytes: Uint8Array, maxBytes: number) => Promise<void>,
+    clear?: () => Promise<void>
+  ): Promise<string[]> {
+    if (!config.current.scrollback.persistOnExit) {
+      if (clear) {
+        try {
+          await clear();
+        } catch {
+          /* best-effort */
+        }
+      }
+      return [];
+    }
+    const max = config.current.scrollback.persistMaxBytes;
+    const keys: string[] = [];
+    const encoder = new TextEncoder();
+    for (const id of store.paneOrder) {
+      const handle = handles[id];
+      if (!handle) continue;
+      try {
+        const text = handle.serialize();
+        if (!text) continue;
+        await write(id, encoder.encode(text), max);
+        keys.push(id);
+      } catch {
+        // Per-pane failures shouldn't abort the rest of the dump.
+      }
+    }
+    return keys;
+  }
+
+  /**
+   * Replay scrollback bytes for each pane the previous session recorded.
+   * Stash into `pendingScrollback` so `registerHandle` can flush them as
+   * each restored pane reaches the "Terminal mounted" state.
+   */
+  async function loadAutosaveScrollbackInto(keys: readonly string[]): Promise<void> {
+    if (keys.length === 0) return;
+    for (const id of keys) {
+      try {
+        const bytes = await readAutosaveScrollback(id);
+        if (bytes.length > 0) pendingScrollback.set(id, bytes);
+      } catch {
+        /* skip — missing scrollback is non-fatal */
+      }
+    }
+  }
+
+  // --- Command palette ---
+
+  let paletteOpen: boolean = $state(false);
+  let paletteActions: PaletteAction[] = $state([]);
+  let sessionCatalog: SessionMetadata[] = $state([]);
+  let settingsOpen: boolean = $state(false);
+  let settingsSection: SettingsSection | null = $state(null);
+
+  async function refreshSessions(): Promise<void> {
+    try {
+      sessionCatalog = await listSessions();
+    } catch {
+      sessionCatalog = [];
+    }
+  }
+
+  const paletteHooks: PaletteHooks = {
+    async sendToPane(targetId) {
+      await sendSelection(store.focusedPaneId, targetId);
+    },
+    async saveSession() {
+      const name = window.prompt("Save session as:");
+      if (!name) return;
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      // Dump scrollback under this name first; the JSON's
+      // `scrollbackKeys` then advertises what's on disk to load() later.
+      const keys = await persistScrollback((paneId, bytes, max) =>
+        writeSessionScrollback(trimmed, paneId, bytes, max)
+      );
+      const data = snapshotSession(trimmed);
+      data.scrollbackKeys = keys;
+      await saveSessionRust(trimmed, data);
+      await refreshSessions();
+    },
+    async loadSession(name) {
+      const data = await loadSessionRust(name);
+      if (!data?.layout) return;
+      // Read scrollback into the pending map BEFORE we apply the layout,
+      // so the freshly-mounted Pane handles drain straight into the
+      // restored terminals.
+      if (data.scrollbackKeys?.length) {
+        for (const paneId of data.scrollbackKeys) {
+          try {
+            const bytes = await readSessionScrollback(name, paneId);
+            if (bytes.length > 0) pendingScrollback.set(paneId, bytes);
+          } catch {
+            /* skip pane */
+          }
+        }
+      }
+      applyLayoutPayload(data.layout);
+      if (data.sendOptions) {
+        sendOptions = {
+          bracketedPaste: data.sendOptions.bracketedPaste,
+          trailingNewline: data.sendOptions.trailingNewline,
+        };
+      }
+    },
+    async deleteSession(name) {
+      await deleteSessionRust(name);
+      await refreshSessions();
+    },
+    openSettings(section) {
+      settingsSection = section ?? null;
+      settingsOpen = true;
+    },
+    bumpFont(delta) {
+      fontSize = clampFontSize(fontSize + delta * FONT_STEP);
+      persistFontSize(fontSize);
+    },
+    resetFont() {
+      fontSize = DEFAULT_FONT_SIZE;
+      persistFontSize(fontSize);
+    },
+  };
+
+  async function openPalette(): Promise<void> {
+    await refreshSessions();
+    paletteActions = buildActions({
+      store,
+      config: config.current,
+      sessions: sessionCatalog,
+      hooks: paletteHooks,
+    });
+    paletteOpen = true;
+  }
+
+  function closePalette(): void {
+    paletteOpen = false;
+  }
 
   // Viewport dimensions for the absolute-positioning layer. `bind:clientWidth`
   // is reactive, but its underlying `ResizeObserver` is stubbed in vitest
@@ -215,6 +522,18 @@
   function registerHandle(id: PaneId, handle: PaneHandle | undefined) {
     if (handle) {
       handles[id] = handle;
+      // Drain any pending scrollback now that the Terminal API is alive.
+      // Done on the next microtask so the replay lands after the
+      // Terminal's own onMount has wired its addons.
+      const pending = pendingScrollback.get(id);
+      if (pending) {
+        pendingScrollback.delete(id);
+        queueMicrotask(() => {
+          // The pane may have been closed between registration and this
+          // microtask — re-check via the live map.
+          handles[id]?.replay(pending);
+        });
+      }
     } else {
       delete handles[id];
     }
@@ -231,14 +550,17 @@
       case "Equal":
         event.preventDefault();
         fontSize = clampFontSize(fontSize + FONT_STEP);
+        persistFontSize(fontSize);
         return;
       case "Minus":
         event.preventDefault();
         fontSize = clampFontSize(fontSize - FONT_STEP);
+        persistFontSize(fontSize);
         return;
       case "Digit0":
         event.preventDefault();
         fontSize = DEFAULT_FONT_SIZE;
+        persistFontSize(fontSize);
         return;
     }
 
@@ -262,6 +584,20 @@
     }
     if (event.shiftKey) return;
 
+    // Modal hotkeys are routed by `event.code` (physical key) for the same
+    // layout-stability reason as Cmd+1..N. Cmd+P / Cmd+, are spec §13.
+    switch (event.code) {
+      case "KeyP":
+        event.preventDefault();
+        void openPalette();
+        return;
+      case "Comma":
+        event.preventDefault();
+        settingsSection = null;
+        settingsOpen = true;
+        return;
+    }
+
     const focused = handles[store.focusedPaneId];
     switch (event.key) {
       case "k":
@@ -284,8 +620,75 @@
 
   onMount(() => {
     window.addEventListener("keydown", handleKeydown);
+
+    // Async bootstrap. Each step is wrapped so a missing IPC backend (the
+    // Vitest mock returns undefined for everything) silently keeps the
+    // synchronous defaults instead of breaking the mount.
+    let unsubConfig: (() => void) | undefined;
+    let unsubConfigEvent: (() => void) | undefined;
+    let teardownAutosave: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        unsubConfig = await config.attach();
+      } catch {
+        /* stay on defaults */
+      }
+      // Initial sync: pull values out of the freshly-loaded config.
+      syncFromConfig(config.current);
+      // Hot-reload sync: react to the watcher's `config:changed` event.
+      try {
+        unsubConfigEvent = await onConfigChanged((cfg) => syncFromConfig(cfg));
+      } catch {
+        /* no live watcher available (e.g. tests) */
+      }
+
+      // Restore the previous session if the user has opted in (default on)
+      // and an autosave file exists. Honoured before installing the new
+      // listeners so an immediate quit doesn't overwrite the prior dump
+      // with the boot snapshot.
+      if (config.current.session.restoreOnLaunch) {
+        try {
+          const prev = await readAutosave();
+          if (prev?.layout?.tree && prev.layout.panes) {
+            // Stage scrollback BEFORE the panes mount so each handle
+            // registration can drain its bytes.
+            if (prev.scrollbackKeys?.length) {
+              await loadAutosaveScrollbackInto(prev.scrollbackKeys);
+            }
+            applyLayoutPayload(prev.layout);
+            if (prev.sendOptions) {
+              // Session-recorded send options outrank the config copy — the
+              // user explicitly chose them last run.
+              sendOptions = {
+                bracketedPaste: prev.sendOptions.bracketedPaste,
+                trailingNewline: prev.sendOptions.trailingNewline,
+              };
+            }
+          }
+        } catch {
+          /* ignore restore failures */
+        }
+      }
+
+      teardownAutosave = installAutosave({
+        snapshot: () => snapshotSession(),
+        enabled: () => config.current.session.autosaveOnExit,
+        persistScrollback: () =>
+          persistScrollback(writeAutosaveScrollback, clearAutosaveScrollback),
+      });
+    })();
+
     return () => {
       window.removeEventListener("keydown", handleKeydown);
+      unsubConfig?.();
+      unsubConfigEvent?.();
+      teardownAutosave?.();
+      // Intentionally NO autosave write here — unmount also fires during
+      // HMR / test cleanup, both of which would overwrite a legitimate
+      // previous-session file with whatever ephemeral state the test had.
+      // visibilitychange + beforeunload cover the real "user is leaving"
+      // paths.
     };
   });
 </script>
@@ -370,6 +773,9 @@
           cwd={pane.cwd}
           env={pane.env}
           {fontSize}
+          {fontFamily}
+          {terminalTheme}
+          {scrollback}
           focused={store.focusedPaneId === pane.id}
           onfocus={() => store.focus(pane.id)}
           sendTargets={sendTargetsFor(pane.id)}
@@ -399,4 +805,11 @@
       />
     {/each}
   </div>
+  <CommandPalette open={paletteOpen} actions={paletteActions} onclose={closePalette} />
+  <SettingsPanel
+    open={settingsOpen}
+    {config}
+    initialSection={settingsSection}
+    onclose={() => (settingsOpen = false)}
+  />
 </div>

@@ -117,9 +117,32 @@ export interface LayoutStore {
   deleteCustomLayout(name: string): void;
   /** Names of every saved custom layout, in insertion order. */
   listCustomLayouts(): string[];
+
+  /**
+   * Deep-cloned snapshot of the whole store — tree + panes + focus +
+   * customLayouts — for session persistence. The clone is the source of
+   * truth at call time; later mutations don't reach the returned value.
+   */
+  exportSnapshot(): {
+    tree: LayoutNode;
+    panes: Record<PaneId, PaneSpec>;
+    focusedPaneId: PaneId;
+    customLayouts: Record<string, LayoutSnapshot>;
+  };
+  /**
+   * Replace the entire store from a previously-exported snapshot. Used by
+   * session restore on launch. Custom layouts are repopulated by name.
+   */
+  importSnapshot(snap: {
+    tree: LayoutNode;
+    panes: Record<PaneId, PaneSpec>;
+    focusedPaneId: PaneId;
+    customLayouts?: Record<string, LayoutSnapshot>;
+  }): void;
 }
 
-/** Default spec for newly-spawned panes. PR-14 will read this from config.toml. */
+/** Built-in default for newly-spawned panes. Used when no config-driven
+ *  override has been wired in (tests, very-early startup before config loads). */
 export function defaultPaneSpec(label: string, id: PaneId): PaneSpec {
   return {
     id,
@@ -147,6 +170,14 @@ function defaultIdFactory(): IdFactory {
 
 export interface CreateLayoutStoreOptions {
   idFactory?: IdFactory;
+  /**
+   * Factory for the default pane spec applied when a new pane is minted
+   * with no caller-supplied `command`. AppRoot injects a config-driven
+   * version here so user settings (`defaultPane`) flow into newly created
+   * panes (preset growth, blank duplicates) without each call site
+   * threading the config through.
+   */
+  defaultPaneSpec?: (label: string, id: PaneId) => PaneSpec;
 }
 
 export function createLayoutStore(
@@ -154,6 +185,7 @@ export function createLayoutStore(
   options: CreateLayoutStoreOptions = {}
 ): LayoutStore {
   const ids = options.idFactory ?? defaultIdFactory();
+  const makeDefaultSpec = options.defaultPaneSpec ?? defaultPaneSpec;
 
   // Treat the initial snapshot as the *source of truth*; defensive-clone the
   // panes record so callers that mutate the original literal can't bleed
@@ -185,7 +217,7 @@ export function createLayoutStore(
 
   function mintPaneSpec(input?: NewPaneInput): PaneSpec {
     const id = ids.pane();
-    const base = defaultPaneSpec(input?.label ?? autoLabel(), id);
+    const base = makeDefaultSpec(input?.label ?? autoLabel(), id);
     return {
       ...base,
       ...(input?.command !== undefined && { command: input.command }),
@@ -307,7 +339,7 @@ export function createLayoutStore(
         const fresh: PaneId[] = [];
         for (let i = 0; i < remaining; i++) {
           const id = ids.pane();
-          const spec = defaultPaneSpec(autoLabel(), id);
+          const spec = makeDefaultSpec(autoLabel(), id);
           panes = { ...panes, [id]: spec };
           fresh.push(id);
         }
@@ -345,6 +377,33 @@ export function createLayoutStore(
       tree = structuredClone(snap.tree);
       if (detach.length > 0) detachedPanes.push(...detach);
       focusedPaneId = snap.focusedPaneId;
+      ensureFocusedExists();
+    },
+
+    exportSnapshot() {
+      const cl: Record<string, LayoutSnapshot> = {};
+      for (const [key, snap] of customLayouts) {
+        cl[key] = structuredClone(snap);
+      }
+      return {
+        tree: structuredClone(tree),
+        panes: structuredClone(panes),
+        focusedPaneId,
+        customLayouts: cl,
+      };
+    },
+
+    importSnapshot(snap) {
+      tree = structuredClone(snap.tree);
+      panes = structuredClone(snap.panes);
+      focusedPaneId = snap.focusedPaneId;
+      detachedPanes.splice(0, detachedPanes.length);
+      customLayouts.clear();
+      if (snap.customLayouts) {
+        for (const [key, value] of Object.entries(snap.customLayouts)) {
+          customLayouts.set(key, structuredClone(value));
+        }
+      }
       ensureFocusedExists();
     },
 

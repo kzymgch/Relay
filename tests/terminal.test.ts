@@ -165,6 +165,21 @@ describe("Terminal component", () => {
     expect(term.options.theme).toEqual({ background: "#fff" });
   });
 
+  it("propagates a scrollback change to xterm.options (reactive)", async () => {
+    let api: TerminalApi | undefined;
+    const onready = (a: TerminalApi) => {
+      api = a;
+    };
+    const { rerender } = render(Terminal, {
+      props: { onready, scrollback: 5000 },
+    });
+    await vi.waitFor(() => expect(api).toBeDefined());
+    const term = getXtermState().instances.at(-1)!;
+    expect(term.options.scrollback).toBe(5000);
+    await rerender({ onready, scrollback: 20000 });
+    expect(term.options.scrollback).toBe(20000);
+  });
+
   it("unmount disposes the xterm instance", async () => {
     const { container, unmount } = await mount();
     const term = getXtermState().instances.at(-1)!;
