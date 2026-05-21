@@ -28,6 +28,16 @@ use crate::pty::{ExitStatus, Pty, PtyConfig, PtyError};
 const FLUSH_BYTES: usize = 32 * 1024;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
+/// Bracketed paste sequences (xterm DEC mode 2004). When the receiving program
+/// has enabled bracketed paste, it sees the wrapped payload as paste data
+/// rather than typed input — shells like zsh and bash use this to avoid
+/// executing pasted commands immediately. A trailing newline, if requested,
+/// goes *after* the close marker so it acts as a deliberate "press Enter"
+/// once the paste is finished (this is what iTerm2 and tmux's
+/// `send-keys -l ... Enter` do).
+pub const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+pub const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -337,6 +347,52 @@ pub async fn pty_spawn(
 #[tauri::command]
 pub fn pty_write(state: State<'_, BridgeState>, id: String, data: Vec<u8>) -> Result<(), String> {
     state.registry.write(&id, &data).map_err(|e| e.to_string())
+}
+
+/// Build the payload that will be written to the target PTY for an inter-pane
+/// send. Kept as a free function so the wrapping policy is unit-testable
+/// without standing up a registry.
+pub fn build_send_payload(text: &str, bracketed_paste: bool, trailing_newline: bool) -> Vec<u8> {
+    let body = text.as_bytes();
+    let mut out = Vec::with_capacity(
+        body.len()
+            + if bracketed_paste {
+                BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len()
+            } else {
+                0
+            }
+            + usize::from(trailing_newline),
+    );
+    if bracketed_paste {
+        out.extend_from_slice(BRACKETED_PASTE_START);
+    }
+    out.extend_from_slice(body);
+    if bracketed_paste {
+        out.extend_from_slice(BRACKETED_PASTE_END);
+    }
+    if trailing_newline {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Send selected text from one pane to another's PTY. Wraps the payload in
+/// bracketed paste markers (so the receiver can distinguish paste from typed
+/// input) and optionally appends a newline to auto-submit. Both behaviors
+/// are user-configurable; defaults match spec §8.
+#[tauri::command]
+pub fn pty_send_text(
+    state: State<'_, BridgeState>,
+    id: String,
+    text: String,
+    bracketed_paste: bool,
+    trailing_newline: bool,
+) -> Result<(), String> {
+    let payload = build_send_payload(&text, bracketed_paste, trailing_newline);
+    state
+        .registry
+        .write(&id, &payload)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -690,6 +746,111 @@ mod tests {
             msg.contains("unknown pty id"),
             "expected 'unknown pty id' in error, got {msg:?}"
         );
+    }
+
+    #[test]
+    fn build_send_payload_wraps_bracketed_paste() {
+        // Bracketed paste mode (DEC 2004) requires the payload to be enclosed
+        // in CSI 200 ~ / CSI 201 ~ so the receiver can distinguish pasted
+        // bytes from typed input.
+        let bytes = build_send_payload("hello", true, false);
+        assert_eq!(bytes, b"\x1b[200~hello\x1b[201~");
+    }
+
+    #[test]
+    fn build_send_payload_appends_newline_outside_markers() {
+        // The trailing newline lives *after* the close marker so the receiver
+        // treats it as a deliberate "press Enter" once paste mode has exited.
+        // If it were inside the markers it would be processed as part of the
+        // pasted text, defeating the auto-submit affordance.
+        let bytes = build_send_payload("ls", true, true);
+        assert_eq!(bytes, b"\x1b[200~ls\x1b[201~\n");
+    }
+
+    #[test]
+    fn build_send_payload_without_bracketed_paste_is_raw() {
+        // Opt-out path: some shells / programs do not understand bracketed
+        // paste and the user expects the bytes verbatim.
+        let bytes = build_send_payload("ping", false, true);
+        assert_eq!(bytes, b"ping\n");
+    }
+
+    #[test]
+    fn build_send_payload_empty_text_still_wraps() {
+        // Sending an empty selection should still produce a well-formed
+        // bracketed-paste burst so the receiver doesn't enter a half-open
+        // state. The frontend will typically suppress empty sends, but the
+        // backend must not corrupt the stream if one slips through.
+        let bytes = build_send_payload("", true, false);
+        assert_eq!(bytes, b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn build_send_payload_preserves_inner_newlines() {
+        // Multi-line selections must reach the receiver as a single bracketed
+        // burst — splitting on '\n' would let the shell execute each line.
+        let bytes = build_send_payload("a\nb\nc", true, false);
+        assert_eq!(bytes, b"\x1b[200~a\nb\nc\x1b[201~");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_text_delivers_bracketed_payload_to_child() {
+        // End-to-end through the registry: with PTY echo enabled, the
+        // line-discipline echoes the bytes we wrote back through the master,
+        // and we observe them in the data sink. This proves the bracketed
+        // paste framing reaches the slave intact — no chunking, no escape
+        // mangling. We kill the child once we've seen the markers rather
+        // than relying on a child that reads a fixed-size input.
+        let registry = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+
+        let id = "pane-send".to_string();
+        spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            id.clone(),
+            PtyConfig {
+                command: "/bin/sh".into(),
+                // `cat` runs until stdin EOF — we kill it explicitly after
+                // asserting on the echoed bytes.
+                args: vec!["-c".into(), "cat".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn");
+
+        let payload = build_send_payload("hi", true, true);
+        registry.write(&id, &payload).expect("write");
+
+        // Poll the sink until both markers are present, or time out. We
+        // can't synchronously await the data event because forward_loop
+        // coalesces with a small delay.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let raw = sink.data_payload_for(&id);
+            let has_start = raw
+                .windows(BRACKETED_PASTE_START.len())
+                .any(|w| w == BRACKETED_PASTE_START);
+            let has_end = raw
+                .windows(BRACKETED_PASTE_END.len())
+                .any(|w| w == BRACKETED_PASTE_END);
+            if has_start && has_end {
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                assert!(text.contains("hi"), "missing payload body in {text:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "did not observe bracketed-paste markers; sink={:?}",
+                String::from_utf8_lossy(&raw)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Tear down so the forward task drains and the test process can exit.
+        registry.kill(&id).expect("kill");
+        let _ = wait_for_exit(&sink, &id, Duration::from_secs(5)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

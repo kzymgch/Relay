@@ -75,6 +75,10 @@
       serialize: () => serializer.serialize(),
       findNext: (q) => search.findNext(q),
       findPrevious: (q) => search.findPrevious(q),
+      getSelection: () => {
+        const sel = t.getSelection();
+        return sel.length > 0 ? sel : undefined;
+      },
       get cols() {
         return t.cols;
       },

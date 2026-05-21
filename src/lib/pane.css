@@ -87,6 +87,58 @@
   min-height: 0;
 }
 
+.pane-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: transparent;
+}
+
+.pane-menu {
+  position: fixed;
+  min-width: 160px;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+  font:
+    12px/1.3 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: #d4d4d4;
+}
+
+.pane-menu-header {
+  padding: 2px 12px 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+  border-bottom: 1px solid #1a1a1a;
+  margin-bottom: 4px;
+}
+
+.pane-menu button {
+  appearance: none;
+  display: block;
+  width: 100%;
+  padding: 4px 12px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-menu button:hover {
+  background: #3a3a3a;
+}
+
 .pane-error {
   position: absolute;
   inset: 0;
