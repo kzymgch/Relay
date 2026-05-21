@@ -14,6 +14,7 @@
   import { resolveKeybinds } from "./keybind/resolve";
   import { dispatchKey, shouldHandleInEditable } from "./keybind/dispatch";
   import SendPreviewModal from "./send/SendPreviewModal.svelte";
+  import PanesPanel, { type PaneRow } from "./panes/PanesPanel.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import {
     applySessionRules,
@@ -294,6 +295,9 @@
   let pipePanelOpen: boolean = $state(false);
   let logsPanelOpen: boolean = $state(false);
   let logsPanelPaneId: string | null = $state(null);
+  // PR-32: pane settings live in a tabbed modal opened from the toolbar
+  // (was previously a per-pane popover that got clipped near the edges).
+  let panesPanelOpen: boolean = $state(false);
 
   async function refreshPipeRules(): Promise<void> {
     try {
@@ -492,6 +496,31 @@
     if (toIdx < 0 || toIdx >= info.siblingCount) return;
     store.reorderSiblings(info.splitId, info.idx, toIdx);
   }
+
+  /**
+   * Build the rows the `PanesPanel` modal renders, one per visible pane,
+   * in DFS / Cmd+1..N order. `reorderHint` and `isSsh` come from the same
+   * helpers that used to drive the per-pane gear popover, so the modal's
+   * Move / Split / Close buttons behave identically to the old UI.
+   */
+  const paneRows = $derived.by((): PaneRow[] => {
+    const rows: PaneRow[] = [];
+    for (const id of store.paneOrder) {
+      const spec = store.panes[id];
+      if (!spec) continue;
+      rows.push({
+        id,
+        label: spec.label,
+        command: spec.command,
+        args: spec.args,
+        cwd: spec.cwd,
+        env: spec.env,
+        reorderHint: reorderHintFor(id),
+        isSsh: spec.ssh !== undefined,
+      });
+    }
+    return rows;
+  });
 
   // Layout menu state. Local to AppRoot — phase 4 keeps custom layouts in
   // memory; PR-15 will persist via session-save.
@@ -915,6 +944,15 @@
         </div>
       {/if}
     </div>
+    <button
+      type="button"
+      class="layout-menu-toggle"
+      onclick={() => (panesPanelOpen = true)}
+      data-testid="panes-toolbar-toggle"
+      title="Pane settings"
+    >
+      Pane Settings
+    </button>
   </div>
   <div class="layout" bind:clientWidth={viewportW} bind:clientHeight={viewportH}>
     {#each Object.values(store.panes) as pane (pane.id)}
@@ -942,17 +980,6 @@
           onsenddropped={(info) => handleSendDropped(info.sourcePaneId, pane.id, info.text)}
           onregister={(h) => registerHandle(pane.id, h)}
           onclose={canClose() ? () => store.closePane(pane.id) : undefined}
-          onsplit={(direction, position) => {
-            const newId = store.splitPane(pane.id, direction, position);
-            if (newId) store.focus(newId);
-          }}
-          onduplicate={() => {
-            const newId = store.duplicatePane(pane.id, "row");
-            if (newId) store.focus(newId);
-          }}
-          reorderHint={reorderHintFor(pane.id)}
-          onreorder={(delta) => reorderPane(pane.id, delta)}
-          onupdatemeta={(patch) => store.updatePaneMeta(pane.id, patch)}
         />
       </div>
     {/each}
@@ -1016,5 +1043,23 @@
     defaults={sendOptions}
     onconfirm={confirmPreview}
     oncancel={cancelPreview}
+  />
+  <PanesPanel
+    open={panesPanelOpen}
+    panes={paneRows}
+    initialPaneId={store.focusedPaneId}
+    canClose={canClose()}
+    onupdatemeta={(paneId, patch) => store.updatePaneMeta(paneId, patch)}
+    onsplit={(paneId, direction, position) => {
+      const newId = store.splitPane(paneId, direction, position);
+      if (newId) store.focus(newId);
+    }}
+    onduplicate={(paneId) => {
+      const newId = store.duplicatePane(paneId, "row");
+      if (newId) store.focus(newId);
+    }}
+    onreorder={(paneId, delta) => reorderPane(paneId, delta)}
+    onclosepane={(paneId) => store.closePane(paneId)}
+    onclose={() => (panesPanelOpen = false)}
   />
 </div>
