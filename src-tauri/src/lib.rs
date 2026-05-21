@@ -1,4 +1,11 @@
+pub mod bridge;
 pub mod pty;
+
+use std::sync::Arc;
+
+use tauri::Manager;
+
+use bridge::{BridgeState, PtyRegistry, TauriEventSink};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -10,7 +17,19 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .setup(|app| {
+            let registry = Arc::new(PtyRegistry::new());
+            let sink = Arc::new(TauriEventSink::new(app.handle().clone()));
+            app.manage(BridgeState::new(registry, sink));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            bridge::pty_spawn,
+            bridge::pty_write,
+            bridge::pty_resize,
+            bridge::pty_kill,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

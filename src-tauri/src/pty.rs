@@ -78,7 +78,7 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    output_rx: mpsc::Receiver<Vec<u8>>,
+    output_rx: Option<mpsc::Receiver<Vec<u8>>>,
     exit_rx: Option<oneshot::Receiver<ExitStatus>>,
     cached_exit: Option<ExitStatus>,
 }
@@ -150,10 +150,23 @@ impl Pty {
             master: pair.master,
             writer,
             killer,
-            output_rx,
+            output_rx: Some(output_rx),
             exit_rx: Some(exit_rx),
             cached_exit: None,
         })
+    }
+
+    /// Move the output receiver out of the `Pty`. After this call, `recv` /
+    /// `try_recv` will return `None`. Used by the Tauri bridge to forward
+    /// chunks to the frontend from a dedicated task.
+    pub fn take_output_rx(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.output_rx.take()
+    }
+
+    /// Move the exit receiver out of the `Pty`. After this call, `wait` /
+    /// `try_wait` will return `AlreadyExited` / `None`.
+    pub fn take_exit_rx(&mut self) -> Option<oneshot::Receiver<ExitStatus>> {
+        self.exit_rx.take()
     }
 
     pub fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
@@ -177,14 +190,16 @@ impl Pty {
         Ok(())
     }
 
-    /// Wait for the next output chunk. Returns `None` after EOF.
+    /// Wait for the next output chunk. Returns `None` after EOF or if the
+    /// receiver has been taken via [`take_output_rx`].
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.output_rx.recv().await
+        self.output_rx.as_mut()?.recv().await
     }
 
-    /// Non-blocking output peek.
+    /// Non-blocking output peek. Returns `None` if no chunk is ready, the
+    /// stream is closed, or the receiver has been taken.
     pub fn try_recv(&mut self) -> Option<Vec<u8>> {
-        self.output_rx.try_recv().ok()
+        self.output_rx.as_mut()?.try_recv().ok()
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus> {
