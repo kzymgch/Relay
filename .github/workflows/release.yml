@@ -19,6 +19,13 @@ on:
 permissions:
   contents: write
 
+# Opt every JS-based action in this workflow into Node 24 now. GitHub will
+# flip this to the default on 2026-06-02 and remove Node 20 from the
+# runner on 2026-09-16 — setting the flag here silences the deprecation
+# warning today and means no scramble when the deadline lands.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     name: Build macOS bundle

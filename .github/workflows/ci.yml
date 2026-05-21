@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Force every JS-based action onto Node 24 ahead of the GitHub-imposed
+# 2026-06-02 cutover (Node 20 is removed on 2026-09-16). Silences the
+# deprecation banner today and means no scramble at the deadline.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   frontend:
     name: Frontend (lint / typecheck / test / format)
