@@ -39,6 +39,20 @@
     return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, n));
   }
 
+  /**
+   * Map a `KeyboardEvent.code` like "Digit3" to `3`, returning `undefined`
+   * for anything else. We use `code` rather than `key` for digit shortcuts
+   * because `event.key` is layout- and Shift-dependent: on a US keyboard
+   * Cmd+Shift+2 surfaces as `"@"`, not `"2"`, so a `parseInt(event.key, 10)`
+   * gate would silently swallow the user's send-to-pane-2 keystroke.
+   * `event.code` describes the physical key and is stable across layouts
+   * and modifiers.
+   */
+  function digitFromCode(code: string): number | undefined {
+    const m = /^Digit([1-9])$/.exec(code);
+    return m ? Number.parseInt(m[1]!, 10) : undefined;
+  }
+
   // Pane handles registered via `onregister`. Plain object rather than $state
   // because we read them at the moment of action (keystroke / menu click);
   // no view needs to re-render when they change.
@@ -112,49 +126,46 @@
     if (!event.metaKey) return;
     if (event.ctrlKey || event.altKey) return;
 
-    // Font size first: "+" / "_" naturally require Shift on US layouts, and
-    // we want Cmd++ to behave like Cmd+= regardless of how the key is
-    // surfaced to JS.
-    switch (event.key) {
-      case "=":
-      case "+":
+    // Symbol-keyed shortcuts: keyed off `event.code` so layout / Shift can't
+    // mask them (e.g. Cmd++ surfaces Shift+Equal on US; the physical key is
+    // still "Equal").
+    switch (event.code) {
+      case "Equal":
         event.preventDefault();
         fontSize = clampFontSize(fontSize + FONT_STEP);
         return;
-      case "-":
-      case "_":
+      case "Minus":
         event.preventDefault();
         fontSize = clampFontSize(fontSize - FONT_STEP);
         return;
-      case "0":
+      case "Digit0":
         event.preventDefault();
         fontSize = DEFAULT_FONT_SIZE;
         return;
     }
 
-    // Cmd+Shift+1..N — send the focused pane's selection to pane N.
-    if (event.shiftKey) {
-      const digit = Number.parseInt(event.key, 10);
-      if (Number.isFinite(digit) && digit >= 1 && digit <= panes.length) {
-        event.preventDefault();
-        void sendSelection(focusedId, panes[digit - 1]!.id);
-      }
-      // Other Cmd+Shift+* combos are reserved for later PRs (palette,
-      // settings, etc).
-      return;
-    }
-
-    // Cmd+1..N — focus pane N.
-    const digit = Number.parseInt(event.key, 10);
-    if (Number.isFinite(digit) && digit >= 1 && digit <= panes.length) {
+    // Digit shortcuts. `event.code === "Digit2"` for the physical "2" key
+    // regardless of Shift, so Cmd+Shift+2 (which surfaces `key === "@"` on
+    // US) and Cmd+2 (which surfaces `key === "2"`) both route correctly.
+    const digit = digitFromCode(event.code);
+    if (digit !== undefined && digit <= panes.length) {
       event.preventDefault();
-      focusedId = panes[digit - 1]!.id;
-      // The Pane's $effect on `focused` will pull xterm focus too, so we
-      // don't need to call handle.focus() explicitly.
+      if (event.shiftKey) {
+        // Cmd+Shift+1..N — send the focused pane's selection to pane N.
+        void sendSelection(focusedId, panes[digit - 1]!.id);
+      } else {
+        // Cmd+1..N — focus pane N. The Pane's $effect on `focused` will
+        // pull xterm focus too, so we don't need handle.focus() here.
+        focusedId = panes[digit - 1]!.id;
+      }
       return;
     }
+    // Other Cmd+Shift+* combos are reserved for later PRs (palette,
+    // settings, etc); fall through silently.
+    if (event.shiftKey) return;
 
-    // Single-letter shortcuts dispatched against the focused pane.
+    // Single-letter shortcuts dispatched against the focused pane. Letters
+    // are unaffected by Shift's glyph substitution, so `event.key` is fine.
     const focused = handles[focusedId];
     switch (event.key) {
       case "k":

@@ -104,7 +104,15 @@ describe("Page — inter-pane send", () => {
 
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "2", metaKey: true, shiftKey: true });
+    // On a US keyboard a real Cmd+Shift+2 surfaces with `key === "@"` and
+    // `code === "Digit2"`. The dispatch mirrors that so we'd catch any
+    // regression to event.key-based gating.
+    await fireEvent.keyDown(window, {
+      key: "@",
+      code: "Digit2",
+      metaKey: true,
+      shiftKey: true,
+    });
 
     await vi.waitFor(() => {
       expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeDefined();
@@ -126,7 +134,12 @@ describe("Page — inter-pane send", () => {
     left!.selection = "echo hi";
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "3", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "#",
+      code: "Digit3",
+      metaKey: true,
+      shiftKey: true,
+    });
 
     await vi.waitFor(() => {
       expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeDefined();
@@ -140,7 +153,12 @@ describe("Page — inter-pane send", () => {
     left!.selection = "ls";
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "1", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "!",
+      code: "Digit1",
+      metaKey: true,
+      shiftKey: true,
+    });
     // Give the async sendSelection a tick to run.
     await new Promise((r) => setTimeout(r, 20));
     expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeUndefined();
@@ -151,18 +169,26 @@ describe("Page — inter-pane send", () => {
     // Selection defaults to empty on all panes.
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "2", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "@",
+      code: "Digit2",
+      metaKey: true,
+      shiftKey: true,
+    });
     await new Promise((r) => setTimeout(r, 20));
     expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeUndefined();
   });
 
-  it("ignores Cmd+<digit> without Shift so it stays free for PR-09 focus shortcuts", async () => {
+  it("ignores Cmd+<digit> without Shift on a send-targeting test (focuses instead)", async () => {
+    // Cmd+digit alone is the focus shortcut, not a send; pty_send_text must
+    // not fire. (Replaces the old "stays free for PR-09" guard now that
+    // PR-09 has actually wired Cmd+1..N to focus.)
     await mountPage();
     const [left] = getXtermState().instances;
     left!.selection = "ls";
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "2", metaKey: true, shiftKey: false });
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true });
     await new Promise((r) => setTimeout(r, 20));
     expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeUndefined();
   });
@@ -179,7 +205,12 @@ describe("Page — inter-pane send", () => {
     emitTauriEvent("pty:exit", { paneId: "pane-2", code: 0, success: true });
     invocations = [];
 
-    await fireEvent.keyDown(window, { key: "2", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "@",
+      code: "Digit2",
+      metaKey: true,
+      shiftKey: true,
+    });
     await new Promise((r) => setTimeout(r, 20));
     expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeUndefined();
   });
@@ -191,14 +222,14 @@ describe("Page — inter-pane send", () => {
     instances[1]!.focus.mockClear();
     instances[2]!.focus.mockClear();
 
-    await fireEvent.keyDown(window, { key: "2", metaKey: true });
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[1]!.focus).toHaveBeenCalled();
     });
     const panes = Array.from(container.querySelectorAll(".pane")) as HTMLElement[];
     expect(panes[1]!.classList.contains("focused")).toBe(true);
 
-    await fireEvent.keyDown(window, { key: "3", metaKey: true });
+    await fireEvent.keyDown(window, { key: "3", code: "Digit3", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[2]!.focus).toHaveBeenCalled();
     });
@@ -239,25 +270,32 @@ describe("Page — inter-pane send", () => {
     expect(panes[0]!.querySelector('[data-testid="pane-search"]')).not.toBeNull();
   });
 
-  it("Cmd+= / Cmd+- adjust font size on every pane in lock-step", async () => {
+  it("Cmd+= / Cmd++ / Cmd+- adjust font size on every pane in lock-step", async () => {
     await mountPage();
     const instances = getXtermState().instances;
     const initial = instances[0]!.options.fontSize as number;
     expect(typeof initial).toBe("number");
 
-    await fireEvent.keyDown(window, { key: "=", metaKey: true });
+    await fireEvent.keyDown(window, { key: "=", code: "Equal", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[0]!.options.fontSize).toBe(initial + 1);
     });
     expect(instances[1]!.options.fontSize).toBe(initial + 1);
     expect(instances[2]!.options.fontSize).toBe(initial + 1);
 
-    await fireEvent.keyDown(window, { key: "+", metaKey: true, shiftKey: true });
+    // Cmd++ on a US keyboard is physically Shift+Equal — `key === "+"`,
+    // `code === "Equal"`. Code-based dispatch keeps this working.
+    await fireEvent.keyDown(window, {
+      key: "+",
+      code: "Equal",
+      metaKey: true,
+      shiftKey: true,
+    });
     await vi.waitFor(() => {
       expect(instances[0]!.options.fontSize).toBe(initial + 2);
     });
 
-    await fireEvent.keyDown(window, { key: "-", metaKey: true });
+    await fireEvent.keyDown(window, { key: "-", code: "Minus", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[0]!.options.fontSize).toBe(initial + 1);
     });
@@ -268,13 +306,13 @@ describe("Page — inter-pane send", () => {
     const instances = getXtermState().instances;
     const initial = instances[0]!.options.fontSize as number;
 
-    await fireEvent.keyDown(window, { key: "=", metaKey: true });
-    await fireEvent.keyDown(window, { key: "=", metaKey: true });
+    await fireEvent.keyDown(window, { key: "=", code: "Equal", metaKey: true });
+    await fireEvent.keyDown(window, { key: "=", code: "Equal", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[0]!.options.fontSize).toBe(initial + 2);
     });
 
-    await fireEvent.keyDown(window, { key: "0", metaKey: true });
+    await fireEvent.keyDown(window, { key: "0", code: "Digit0", metaKey: true });
     await vi.waitFor(() => {
       expect(instances[0]!.options.fontSize).toBe(initial);
     });
@@ -285,7 +323,7 @@ describe("Page — inter-pane send", () => {
     const instances = getXtermState().instances;
     const initial = instances[0]!.options.fontSize as number;
     for (let i = 0; i < 50; i++) {
-      await fireEvent.keyDown(window, { key: "-", metaKey: true });
+      await fireEvent.keyDown(window, { key: "-", code: "Minus", metaKey: true });
     }
     const final = instances[0]!.options.fontSize as number;
     expect(final).toBeGreaterThan(0);
