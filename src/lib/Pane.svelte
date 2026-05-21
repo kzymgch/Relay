@@ -40,10 +40,9 @@
   let api: TerminalApi | undefined = $state();
 
   // Non-reactive bookkeeping. `currentPtyId` is the id our listeners route to
-  // right now; setting it to `undefined` instantly detaches the listeners
-  // from any in-flight PTY (e.g. during restart). `destroyed` lets async
-  // continuations after `await` notice the component has unmounted and bail
-  // out before installing listeners or registering a fresh PTY.
+  // right now; clearing it instantly detaches the listeners from any
+  // in-flight PTY (e.g. during restart). `destroyed` lets async continuations
+  // after an `await` notice the component has unmounted and bail out.
   let currentPtyId: PtyId | undefined;
   let destroyed = false;
   let unlistenData: (() => void) | undefined;
@@ -53,8 +52,11 @@
 
   async function installListeners() {
     // Listeners are installed once for the lifetime of the pane and filter
-    // by `currentPtyId`. This avoids losing the very first `pty:data` /
-    // `pty:exit` from short-lived processes that race the JS subscription.
+    // by `currentPtyId`, which is committed to a JS-allocated id *before*
+    // we call spawnPty. That way any pty:data / pty:exit the bridge emits
+    // between starting its forward task and the spawn IPC returning still
+    // routes to us — short-lived processes (echo, programs that print
+    // usage and exit) would otherwise lose their entire output.
     const dataDispose = await onPtyData((id, data) => {
       if (id === currentPtyId) api?.write(data);
     });
@@ -86,32 +88,37 @@
     exitInfo = null;
     errorMessage = undefined;
 
-    const cfg: PtySpawnConfig = { command, args, cwd, env };
+    // Generate the id and commit `currentPtyId` *before* the network call.
+    // From this point on, listeners route bridge-emitted events to us.
+    const id = crypto.randomUUID();
+    currentPtyId = id;
+
+    const cfg: PtySpawnConfig = { id, command, args, cwd, env };
     if (api) {
       cfg.cols = api.cols;
       cfg.rows = api.rows;
     }
 
-    let id: PtyId;
     try {
-      id = await spawnPty(cfg);
+      await spawnPty(cfg);
     } catch (e) {
       if (destroyed) return;
       status = "error";
       errorMessage = e instanceof Error ? e.message : String(e);
+      currentPtyId = undefined;
       return;
     }
 
     if (destroyed) {
-      // The pane unmounted while we were waiting on the backend. Don't
-      // attach the new id; tell the backend to drop the PTY too.
+      // The pane unmounted while we were waiting on the backend. Tell the
+      // backend to drop the PTY too.
+      currentPtyId = undefined;
       void killPty(id).catch(() => {
         // Best-effort — backend will GC on app exit anyway.
       });
       return;
     }
 
-    currentPtyId = id;
     status = "running";
   }
 
@@ -175,6 +182,16 @@
     onfocus?.();
     api?.focus();
   }
+
+  // Keep xterm's real focus in sync with the `focused` prop. The parent
+  // owns the focusedId state (initial load, click, future Cmd+1..N
+  // keybindings), so we react to it here rather than relying on every
+  // call site to also call api.focus().
+  $effect(() => {
+    if (focused && api) {
+      api.focus();
+    }
+  });
 
   onMount(() => {
     return () => {

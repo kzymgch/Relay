@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/svelte";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 
@@ -55,7 +55,8 @@ function installIpcMock(): void {
         if (spawnError) {
           throw new Error(spawnError);
         }
-        return `pane-${nextPaneId++}`;
+        // The id now travels in the request; backend just confirms success.
+        return undefined;
       case "pty_write":
       case "pty_resize":
       case "pty_kill":
@@ -66,6 +67,15 @@ function installIpcMock(): void {
   });
 }
 
+// `crypto.randomUUID()` is called inside Pane.spawn() right before pty_spawn.
+// Tests need predictable ids to assert on, so we stub it with the same
+// "pane-N" sequence the previous backend allocator used.
+const originalRandomUUID = globalThis.crypto.randomUUID.bind(globalThis.crypto);
+function installUuidMock(): void {
+  globalThis.crypto.randomUUID = (() =>
+    `pane-${nextPaneId++}` as ReturnType<Crypto["randomUUID"]>) as Crypto["randomUUID"];
+}
+
 beforeEach(() => {
   invocations = [];
   nextPaneId = 1;
@@ -74,6 +84,11 @@ beforeEach(() => {
   resetTauriEventListeners();
   clearMocks();
   installIpcMock();
+  installUuidMock();
+});
+
+afterEach(() => {
+  globalThis.crypto.randomUUID = originalRandomUUID;
 });
 
 async function mountPane(extraProps: Record<string, unknown> = {}) {
@@ -234,16 +249,17 @@ describe("Pane component", () => {
     );
   });
 
-  it("installs pty:data / pty:exit listeners before pty_spawn is issued", async () => {
-    // Short-lived processes can emit data and exit before the JS listener
-    // would have been attached if it were installed only after spawnPty
-    // resolves. Hold spawn pending and verify listeners are already live by
-    // the time pty_spawn appears in the invocation log.
-    let spawnResolve: ((id: string) => void) | undefined;
+  it("routes pty:data emitted while pty_spawn is still in flight", async () => {
+    // The bridge starts its forward task immediately after spawn_pty returns
+    // and can emit `pty:data` / `pty:exit` before the Tauri response makes
+    // it back to JS. Because the frontend now picks its own id and commits
+    // `currentPtyId` before awaiting spawnPty, the listener can route those
+    // pre-response events instead of dropping them on the floor.
+    let spawnResolve: (() => void) | undefined;
     mockIPC((cmd, args) => {
       invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
       if (cmd === "pty_spawn") {
-        return new Promise<string>((resolve) => {
+        return new Promise<void>((resolve) => {
           spawnResolve = resolve;
         });
       }
@@ -257,23 +273,30 @@ describe("Pane component", () => {
     await vi.waitFor(() => {
       expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
     });
-
-    // At the moment pty_spawn is in flight, both listeners are already
-    // registered. If they weren't, the backend's immediate `pty:data` /
-    // `pty:exit` from a fast-exiting process would slip through.
+    // At this point spawnPty is still pending, but listeners are already
+    // registered AND currentPtyId is already committed to the JS-allocated
+    // id.
     expect(listenerCount("pty:data")).toBe(1);
     expect(listenerCount("pty:exit")).toBe(1);
 
-    // Cleanup.
-    spawnResolve?.("pane-late");
+    const term = getXtermState().instances.at(-1)!;
+    term.write.mockClear();
+    emitTauriEvent("pty:data", { paneId: "pane-1", data: [104, 105] });
+
+    await vi.waitFor(() => {
+      expect(term.write).toHaveBeenCalled();
+    });
+    expect(Array.from(term.write.mock.calls[0]?.[0] as Uint8Array)).toEqual([104, 105]);
+
+    spawnResolve?.();
   });
 
   it("kills the late-arrived PTY when unmount races with spawn", async () => {
-    let spawnResolve: ((id: string) => void) | undefined;
+    let spawnResolve: (() => void) | undefined;
     mockIPC((cmd, args) => {
       invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
       if (cmd === "pty_spawn") {
-        return new Promise<string>((resolve) => {
+        return new Promise<void>((resolve) => {
           spawnResolve = resolve;
         });
       }
@@ -291,18 +314,57 @@ describe("Pane component", () => {
 
     // Backend reports the spawn finally succeeded — after the pane is gone.
     expect(spawnResolve).toBeDefined();
-    spawnResolve?.("pane-orphan");
+    spawnResolve?.();
 
     // The post-await branch must detect `destroyed` and kill the late id so
     // the PTY does not leak in the registry.
     await vi.waitFor(() => {
       const kill = invocations.find((i) => i.cmd === "pty_kill");
       expect(kill).toBeDefined();
-      expect((kill as InvocationLog).args.id).toBe("pane-orphan");
+      // The JS-allocated id (first call to our mocked randomUUID).
+      expect((kill as InvocationLog).args.id).toBe("pane-1");
     });
 
     // No listener should remain attached to the dead pane.
     expect(listenerCount("pty:data")).toBe(0);
     expect(listenerCount("pty:exit")).toBe(0);
+  });
+
+  it("focuses the terminal when the focused prop becomes true", async () => {
+    // Initial mount with focused=false: no focus call yet.
+    const { rerender } = render(Pane, {
+      props: {
+        label: "x",
+        command: "/bin/zsh",
+        focused: false,
+      },
+    });
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+    const focusFn = getXtermState().instances.at(-1)!.focus;
+    expect(focusFn).not.toHaveBeenCalled();
+
+    // Parent now selects this pane — xterm must receive the focus call so
+    // keystrokes go to the right pane without the user clicking.
+    await rerender({
+      label: "x",
+      command: "/bin/zsh",
+      focused: true,
+    });
+    await vi.waitFor(() => {
+      expect(focusFn).toHaveBeenCalled();
+    });
+  });
+
+  it("focuses the terminal when mounted with focused=true", async () => {
+    // The initial layout starts with one pane already selected; that pane
+    // should not require a click to capture keystrokes.
+    const { container } = await mountPane({ focused: true });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const focusFn = getXtermState().instances.at(-1)!.focus;
+    expect(focusFn).toHaveBeenCalled();
   });
 });

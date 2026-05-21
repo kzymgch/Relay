@@ -4,6 +4,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type PaneId = string;
 
 export interface PtySpawnConfig {
+  /**
+   * JS-allocated pane id. The frontend subscribes to `pty:data` / `pty:exit`
+   * with this id *before* invoking spawn so events emitted in the gap
+   * between the bridge starting its forward task and the spawn IPC
+   * returning are routed correctly. The backend rejects duplicate ids.
+   */
+  id: PaneId;
   command: string;
   args?: string[];
   cwd?: string;
@@ -26,8 +33,8 @@ export interface PtyExitPayload {
 export const PTY_DATA_EVENT = "pty:data";
 export const PTY_EXIT_EVENT = "pty:exit";
 
-export async function spawnPty(config: PtySpawnConfig): Promise<PaneId> {
-  return invoke<PaneId>("pty_spawn", { config });
+export async function spawnPty(config: PtySpawnConfig): Promise<void> {
+  await invoke("pty_spawn", { config });
 }
 
 export async function writePty(id: PaneId, data: Uint8Array): Promise<void> {

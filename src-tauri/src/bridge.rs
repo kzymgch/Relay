@@ -107,7 +107,6 @@ pub struct PtyRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
-    next_id: u64,
     ptys: HashMap<String, Arc<Mutex<Pty>>>,
 }
 
@@ -116,18 +115,15 @@ impl PtyRegistry {
         Self::default()
     }
 
-    fn allocate_id(&self) -> String {
+    /// Inserts a freshly spawned `Pty` under `id`. Errors if `id` is already
+    /// taken so callers don't accidentally shadow a live pane.
+    fn insert(&self, id: &str, pty: Pty) -> Result<(), PtyError> {
         let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
-        guard.next_id += 1;
-        format!("pane-{}", guard.next_id)
-    }
-
-    fn insert(&self, id: &str, pty: Pty) {
-        self.inner
-            .lock()
-            .expect("PtyRegistry poisoned")
-            .ptys
-            .insert(id.to_string(), Arc::new(Mutex::new(pty)));
+        if guard.ptys.contains_key(id) {
+            return Err(PtyError::Pty(format!("pane id already exists: {id}")));
+        }
+        guard.ptys.insert(id.to_string(), Arc::new(Mutex::new(pty)));
+        Ok(())
     }
 
     fn get(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
@@ -192,6 +188,12 @@ impl BridgeState {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PtySpawnConfig {
+    /// JS-allocated pane id. Required so the frontend can subscribe to
+    /// `pty:data` / `pty:exit` *before* invoking spawn — otherwise events
+    /// from short-lived processes (`/bin/echo`, programs that print usage
+    /// and exit) emitted between `spawn_pty` returning the id and the
+    /// frontend's continuation resuming would be dropped by id filtering.
+    pub id: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -226,11 +228,14 @@ impl From<PtySpawnConfig> for PtyConfig {
     }
 }
 
+/// Spawn a new PTY under the caller-supplied `id`. The id must be unique in
+/// the registry.
 pub async fn spawn_pty(
     registry: Arc<PtyRegistry>,
     sink: Arc<dyn EventSink>,
+    id: String,
     config: PtyConfig,
-) -> Result<String, PtyError> {
+) -> Result<(), PtyError> {
     let mut pty = Pty::spawn(config)?;
     let output_rx = pty
         .take_output_rx()
@@ -239,8 +244,7 @@ pub async fn spawn_pty(
         .take_exit_rx()
         .expect("freshly spawned pty must have an exit receiver");
 
-    let id = registry.allocate_id();
-    registry.insert(&id, pty);
+    registry.insert(&id, pty)?;
 
     let registry_for_task = registry.clone();
     let sink_for_task = sink;
@@ -258,7 +262,7 @@ pub async fn spawn_pty(
         }
     });
 
-    Ok(id)
+    Ok(())
 }
 
 async fn forward_loop(sink: &dyn EventSink, pane_id: &str, mut rx: mpsc::Receiver<Vec<u8>>) {
@@ -318,10 +322,16 @@ async fn forward_loop(sink: &dyn EventSink, pane_id: &str, mut rx: mpsc::Receive
 pub async fn pty_spawn(
     state: State<'_, BridgeState>,
     config: PtySpawnConfig,
-) -> Result<String, String> {
-    spawn_pty(state.registry.clone(), state.sink.clone(), config.into())
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<(), String> {
+    let id = config.id.clone();
+    spawn_pty(
+        state.registry.clone(),
+        state.sink.clone(),
+        id,
+        config.into(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -421,9 +431,11 @@ mod tests {
         let registry = Arc::new(PtyRegistry::new());
         let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
 
-        let id = spawn_pty(
+        let id = "pane-rw".to_string();
+        spawn_pty(
             registry.clone(),
             sink.clone(),
+            id.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
                 args: vec![
@@ -558,9 +570,11 @@ mod tests {
         let registry = Arc::new(PtyRegistry::new());
         let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
 
-        let a = spawn_pty(
+        let a = "pane-a".to_string();
+        spawn_pty(
             registry.clone(),
             sink.clone(),
+            a.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), "sleep 5".into()],
@@ -570,9 +584,11 @@ mod tests {
         .await
         .expect("spawn A");
 
-        let b = spawn_pty(
+        let b = "pane-b".to_string();
+        spawn_pty(
             registry.clone(),
             sink.clone(),
+            b.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), "sleep 5".into()],
@@ -617,6 +633,49 @@ mod tests {
         let _ = registry.kill(&a);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_with_duplicate_id_errors() {
+        // Frontend allocates ids before spawning, so the bridge must refuse
+        // to shadow an existing pane. Catches a stale id being reused after
+        // a pane was thought to be dead but is actually still in the
+        // registry.
+        let registry = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+        let id = "pane-dup".to_string();
+
+        spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            id.clone(),
+            PtyConfig {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 5".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first spawn");
+
+        let err = spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            id.clone(),
+            PtyConfig {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 5".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("second spawn must error");
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected duplicate id error, got {err:?}"
+        );
+
+        let _ = registry.kill(&id);
+    }
+
     #[test]
     fn kill_on_unknown_id_returns_error() {
         // Kill should match the API surface of write / resize: an unknown
@@ -641,10 +700,17 @@ mod tests {
         let registry = Arc::new(PtyRegistry::new());
         let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
 
-        let (id1, id2, id3) = tokio::join!(
+        let (id1, id2, id3) = (
+            "pane-1".to_string(),
+            "pane-2".to_string(),
+            "pane-3".to_string(),
+        );
+
+        let (r1, r2, r3) = tokio::join!(
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                id1.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
                     args: vec!["pane1".into()],
@@ -654,6 +720,7 @@ mod tests {
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                id2.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
                     args: vec!["pane2".into()],
@@ -663,6 +730,7 @@ mod tests {
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                id3.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
                     args: vec!["pane3".into()],
@@ -671,9 +739,9 @@ mod tests {
             ),
         );
 
-        let id1 = id1.expect("spawn pane1");
-        let id2 = id2.expect("spawn pane2");
-        let id3 = id3.expect("spawn pane3");
+        r1.expect("spawn pane1");
+        r2.expect("spawn pane2");
+        r3.expect("spawn pane3");
 
         // IDs must be unique so the frontend can route data/exit events.
         assert_ne!(id1, id2);
