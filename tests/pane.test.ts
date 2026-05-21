@@ -34,7 +34,7 @@ vi.mock("@tauri-apps/api/event", async () => {
 });
 
 import Pane from "../src/lib/Pane.svelte";
-import { getXtermState, resetXtermMocks } from "./_xterm-mocks";
+import { emitTerminalResize, getXtermState, resetXtermMocks } from "./_xterm-mocks";
 import { emitTauriEvent, listenerCount, resetTauriEventListeners } from "./_tauri-event-mock";
 
 interface InvocationLog {
@@ -669,5 +669,200 @@ describe("Pane component", () => {
     });
     const focusFn = getXtermState().instances.at(-1)!.focus;
     expect(focusFn).toHaveBeenCalled();
+  });
+
+  it("opens the settings popover and emits a patch on Save", async () => {
+    const onupdatemeta = vi.fn();
+    const { container } = await mountPane({
+      label: "Editor",
+      command: "/bin/zsh",
+      args: ["-l"],
+      onupdatemeta,
+    });
+    // Popover starts closed.
+    expect(container.querySelector('[data-testid="pane-settings"]')).toBeNull();
+    const gear = container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement;
+    await fireEvent.click(gear);
+    const popover = container.querySelector('[data-testid="pane-settings"]');
+    expect(popover).not.toBeNull();
+
+    // Fields prefill with the current spec.
+    const labelInput = container.querySelector(
+      '[data-testid="pane-settings-label"]'
+    ) as HTMLInputElement;
+    expect(labelInput.value).toBe("Editor");
+
+    const cmdInput = container.querySelector(
+      '[data-testid="pane-settings-command"]'
+    ) as HTMLInputElement;
+    await fireEvent.input(labelInput, { target: { value: "Logs" } });
+    await fireEvent.input(cmdInput, { target: { value: "/usr/bin/tail" } });
+    const argsInput = container.querySelector(
+      '[data-testid="pane-settings-args"]'
+    ) as HTMLTextAreaElement;
+    // One arg per line — see the comment in Pane.svelte::openSettings; this
+    // shape lets users pass arguments that contain spaces (e.g. `-c "echo hi"`)
+    // without inventing a quoting syntax.
+    await fireEvent.input(argsInput, { target: { value: "-f\n/var/log/syslog" } });
+    const envInput = container.querySelector(
+      '[data-testid="pane-settings-env"]'
+    ) as HTMLTextAreaElement;
+    await fireEvent.input(envInput, { target: { value: "FOO=bar\nBAZ=qux" } });
+
+    const save = container.querySelector('[data-testid="pane-settings-save"]') as HTMLButtonElement;
+    await fireEvent.click(save);
+
+    expect(onupdatemeta).toHaveBeenCalledTimes(1);
+    const patch = onupdatemeta.mock.calls[0]![0];
+    expect(patch.label).toBe("Logs");
+    expect(patch.command).toBe("/usr/bin/tail");
+    expect(patch.args).toEqual(["-f", "/var/log/syslog"]);
+    expect(patch.env).toEqual({ FOO: "bar", BAZ: "qux" });
+    // Popover dismissed after save.
+    expect(container.querySelector('[data-testid="pane-settings"]')).toBeNull();
+  });
+
+  it("preserves args that contain spaces through a settings round-trip", async () => {
+    // Regression: a single-line `args.join(" ")` form would shred
+    // ["-c", "echo hello world"] into ["-c", "echo", "hello", "world"].
+    // The textarea/per-line shape keeps the original arg intact.
+    const onupdatemeta = vi.fn();
+    const { container } = await mountPane({
+      command: "/bin/zsh",
+      args: ["-c", "echo hello world"],
+      onupdatemeta,
+    });
+    const gear = container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement;
+    await fireEvent.click(gear);
+    const argsInput = container.querySelector(
+      '[data-testid="pane-settings-args"]'
+    ) as HTMLTextAreaElement;
+    // Prefill matches the original args, one per line.
+    expect(argsInput.value).toBe("-c\necho hello world");
+    // Save without edits should round-trip identically.
+    const save = container.querySelector('[data-testid="pane-settings-save"]') as HTMLButtonElement;
+    await fireEvent.click(save);
+    expect(onupdatemeta).toHaveBeenCalledTimes(1);
+    expect(onupdatemeta.mock.calls[0]![0].args).toEqual(["-c", "echo hello world"]);
+  });
+
+  it("settings popover shows direction-aware Move buttons and fires onreorder", async () => {
+    const onreorder = vi.fn();
+    // Pane sits inside a `row` parent (sibling 1 of 3) → buttons are
+    // "Move ←" (enabled because canPrev) and "Move →" (enabled because canNext).
+    const { container } = await mountPane({
+      onreorder,
+      reorderHint: { direction: "row", canPrev: true, canNext: true },
+    });
+    const gear = container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement;
+    await fireEvent.click(gear);
+
+    const prev = container.querySelector(
+      '[data-testid="pane-settings-move-prev"]'
+    ) as HTMLButtonElement;
+    const next = container.querySelector(
+      '[data-testid="pane-settings-move-next"]'
+    ) as HTMLButtonElement;
+    expect(prev.textContent?.trim()).toBe("Move ←");
+    expect(next.textContent?.trim()).toBe("Move →");
+    expect(prev.disabled).toBe(false);
+    expect(next.disabled).toBe(false);
+
+    await fireEvent.click(next);
+    expect(onreorder).toHaveBeenCalledWith(1);
+  });
+
+  it("Move buttons disable at the start / end of the sibling list", async () => {
+    const { container } = await mountPane({
+      onreorder: vi.fn(),
+      // First sibling (canPrev=false), last too (canNext=false) → 1 of 1.
+      reorderHint: { direction: "column", canPrev: false, canNext: false },
+    });
+    await fireEvent.click(
+      container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement
+    );
+    const prev = container.querySelector(
+      '[data-testid="pane-settings-move-prev"]'
+    ) as HTMLButtonElement;
+    const next = container.querySelector(
+      '[data-testid="pane-settings-move-next"]'
+    ) as HTMLButtonElement;
+    // Column direction → up/down glyphs.
+    expect(prev.textContent?.trim()).toBe("Move ↑");
+    expect(next.textContent?.trim()).toBe("Move ↓");
+    expect(prev.disabled).toBe(true);
+    expect(next.disabled).toBe(true);
+  });
+
+  it("Move buttons are hidden when the pane has no parent split", async () => {
+    const { container } = await mountPane({
+      // No reorderHint → no Move buttons.
+    });
+    await fireEvent.click(
+      container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement
+    );
+    expect(container.querySelector('[data-testid="pane-settings-move-prev"]')).toBeNull();
+    expect(container.querySelector('[data-testid="pane-settings-move-next"]')).toBeNull();
+  });
+
+  it("settings 'Split right' fires onsplit and closes the popover", async () => {
+    const onsplit = vi.fn();
+    const { container } = await mountPane({ onsplit });
+    const gear = container.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement;
+    await fireEvent.click(gear);
+    const splitRight = container.querySelector(
+      '[data-testid="pane-settings-split-right"]'
+    ) as HTMLButtonElement;
+    await fireEvent.click(splitRight);
+    expect(onsplit).toHaveBeenCalledWith("row", "after");
+    expect(container.querySelector('[data-testid="pane-settings"]')).toBeNull();
+  });
+
+  it("close button is enabled only when onclose is provided", async () => {
+    // No onclose → disabled (single-pane / last-pane case AppRoot models).
+    const { container: noClose } = await mountPane({});
+    const closeBtnDisabled = noClose.querySelector(
+      'button[aria-label="Close pane"]'
+    ) as HTMLButtonElement;
+    expect(closeBtnDisabled.disabled).toBe(true);
+
+    // With onclose → enabled and fires the callback.
+    const onclose = vi.fn();
+    const { container } = await mountPane({ onclose });
+    const closeBtn = container.querySelector(
+      'button[aria-label="Close pane"]'
+    ) as HTMLButtonElement;
+    expect(closeBtn.disabled).toBe(false);
+    await fireEvent.click(closeBtn);
+    expect(onclose).toHaveBeenCalledTimes(1);
+  });
+
+  it("debounces pty_resize while a drag streams xterm resize events", async () => {
+    // PR-11: splitter dragging causes FitAddon → xterm.onResize to fire many
+    // times in quick succession. The Pane must coalesce these into a single
+    // trailing-edge pty_resize IPC so shells (vim/htop) don't flicker on
+    // every frame. We drive the xterm `onResize` callback directly via the
+    // mock and assert the IPC fires exactly once with the *last* size.
+    vi.useFakeTimers();
+    try {
+      const { container } = await mountPane();
+      await vi.waitFor(() => {
+        expect(container.querySelector(".status-running")).not.toBeNull();
+      });
+      invocations = invocations.filter((i) => i.cmd !== "pty_resize");
+
+      emitTerminalResize(81, 25);
+      emitTerminalResize(82, 26);
+      emitTerminalResize(90, 30);
+      // Within the debounce window no IPC has fired yet.
+      expect(invocations.find((i) => i.cmd === "pty_resize")).toBeUndefined();
+
+      vi.advanceTimersByTime(60);
+      const resizes = invocations.filter((i) => i.cmd === "pty_resize");
+      expect(resizes).toHaveLength(1);
+      expect(resizes[0]!.args).toMatchObject({ id: "pane-1", cols: 90, rows: 30 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

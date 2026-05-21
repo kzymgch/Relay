@@ -45,6 +45,15 @@
     onSelect: () => void;
   }
 
+  /** Patch shape consumed by the settings popover's Save button. */
+  export interface PaneMetaPatch {
+    label?: string;
+    command?: string;
+    args?: string[];
+    cwd?: string | undefined;
+    env?: Record<string, string> | undefined;
+  }
+
   interface Props {
     label: string;
     command: string;
@@ -58,11 +67,40 @@
     fontSize?: number;
     focused?: boolean;
     onfocus?: () => void;
-    /**
-     * Close action. Disabled in the fixed three-pane layout; wired up in
-     * PR-12 (`feat/pane-ops`).
-     */
+    /** Remove this pane (PR-12 / phase 3 wires `store.closePane`). */
     onclose?: () => void;
+    /**
+     * Insert a fresh pane next to this one (PR-12 / phase 3). The popover's
+     * "Split right" / "Split down" buttons call this; AppRoot routes the
+     * request to `store.splitPane`.
+     */
+    onsplit?: (direction: "row" | "column", position: "before" | "after") => void;
+    /** Clone this pane's spec next to it (PR-12 / phase 3). */
+    onduplicate?: () => void;
+    /**
+     * Move this pane within its parent split. `delta` is `-1` (toward
+     * index 0 — left for row splits, up for column splits) or `+1` (toward
+     * the last sibling).
+     */
+    onreorder?: (delta: -1 | 1) => void;
+    /**
+     * Source data for the popover's "Move" buttons. AppRoot looks up the
+     * pane's parent split direction + position; this prop tells Pane which
+     * arrow glyphs to show and whether the move buttons should be disabled
+     * at the start / end of the sibling list. `null` (or missing) when the
+     * pane is the lone root leaf and there's nothing to reorder against.
+     */
+    reorderHint?: {
+      direction: "row" | "column";
+      canPrev: boolean;
+      canNext: boolean;
+    } | null;
+    /**
+     * Apply a patch to this pane's PaneSpec. Label updates immediately; the
+     * rest (command / args / cwd / env) take effect on the next restart
+     * because the PTY is already running.
+     */
+    onupdatemeta?: (patch: PaneMetaPatch) => void;
     /**
      * Send-to targets the parent populates with the other panes. When
      * undefined / empty, the right-click menu is suppressed entirely so the
@@ -87,6 +125,11 @@
     focused = false,
     onfocus,
     onclose,
+    onsplit,
+    onduplicate,
+    onreorder,
+    reorderHint,
+    onupdatemeta,
     sendTargets = [],
     onregister,
   }: Props = $props();
@@ -100,6 +143,14 @@
   let searchQuery: string = $state("");
   let searchInputEl: HTMLInputElement | undefined = $state();
 
+  // Settings popover state (PR-12 / phase 3).
+  let settingsOpen: boolean = $state(false);
+  let draftLabel: string = $state("");
+  let draftCommand: string = $state("");
+  let draftArgsRaw: string = $state("");
+  let draftCwd: string = $state("");
+  let draftEnvRaw: string = $state("");
+
   // Non-reactive bookkeeping. `currentPtyId` is the id our listeners route to
   // right now; clearing it instantly detaches the listeners from any
   // in-flight PTY (e.g. during restart). `destroyed` lets async continuations
@@ -108,6 +159,16 @@
   let destroyed = false;
   let unlistenData: (() => void) | undefined;
   let unlistenExit: (() => void) | undefined;
+
+  // Debounced PTY-resize. xterm's FitAddon fires onResize on every container
+  // size change — during a splitter drag that's once per pointermove, and
+  // shells like zsh / vim flicker if pty_resize lands on every frame. We
+  // coalesce to a trailing-edge 60ms timer so the IPC fires once per drag
+  // settle. The 60ms window is short enough to feel instant after release
+  // while broad enough to absorb a fast-moving drag (~16ms per frame).
+  const RESIZE_DEBOUNCE_MS = 60;
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingResize: { cols: number; rows: number } | undefined;
 
   const encoder = new TextEncoder();
 
@@ -221,11 +282,20 @@
   }
 
   function handleResize(cols: number, rows: number) {
-    if (currentPtyId && status === "running") {
-      resizePty(currentPtyId, cols, rows).catch((e: unknown) => {
+    if (!(currentPtyId && status === "running")) return;
+    pendingResize = { cols, rows };
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const target = pendingResize;
+      resizeTimer = undefined;
+      pendingResize = undefined;
+      // Re-check on the trailing edge — the PTY may have been killed
+      // (restart, unmount) while we were waiting.
+      if (!target || !currentPtyId || status !== "running") return;
+      resizePty(currentPtyId, target.cols, target.rows).catch((e: unknown) => {
         console.error("[pane] pty_resize failed", e);
       });
-    }
+    }, RESIZE_DEBOUNCE_MS);
   }
 
   async function restart() {
@@ -299,6 +369,60 @@
     queueMicrotask(() => searchInputEl?.focus());
   }
 
+  function openSettings(): void {
+    // Snapshot the current props into edit drafts so the form starts
+    // populated and Cancel can simply drop the drafts. Args is serialized
+    // one-per-line on purpose: a single-line `args.join(" ")` would lose
+    // the distinction between `["-c", "echo hello world"]` and
+    // `["-c", "echo", "hello", "world"]` round-tripping through the form.
+    draftLabel = label;
+    draftCommand = command;
+    draftArgsRaw = (args ?? []).join("\n");
+    draftCwd = cwd ?? "";
+    draftEnvRaw = Object.entries(env ?? {})
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
+    settingsOpen = true;
+  }
+
+  function closeSettings(): void {
+    settingsOpen = false;
+  }
+
+  function saveSettings(): void {
+    // Args: one per line, empty lines skipped, no whitespace splitting.
+    // Lets users pass arguments that contain spaces (e.g. `-c "echo hi"`)
+    // without inventing a quoting syntax. PR-18's settings GUI may replace
+    // this with a structured list editor.
+    const args = draftArgsRaw
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    const cwdValue = draftCwd.trim() === "" ? undefined : draftCwd;
+    let envValue: Record<string, string> | undefined;
+    if (draftEnvRaw.trim() === "") {
+      envValue = undefined;
+    } else {
+      const parsed: Record<string, string> = {};
+      for (const line of draftEnvRaw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0) continue;
+        parsed[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+      }
+      envValue = parsed;
+    }
+    onupdatemeta?.({
+      label: draftLabel,
+      command: draftCommand,
+      args,
+      cwd: cwdValue,
+      env: envValue,
+    });
+    settingsOpen = false;
+  }
+
   function closeSearch() {
     searchOpen = false;
     searchQuery = "";
@@ -346,6 +470,11 @@
       unlistenExit?.();
       unlistenData = undefined;
       unlistenExit = undefined;
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = undefined;
+        pendingResize = undefined;
+      }
       const id = currentPtyId;
       currentPtyId = undefined;
       if (id) {
@@ -378,13 +507,16 @@
       {/if}
     </span>
     <div class="actions">
+      <button type="button" onclick={openSettings} title="Pane settings" aria-label="Pane settings">
+        ⚙
+      </button>
       <button type="button" onclick={restart} title="Restart" aria-label="Restart pane">⟳</button>
       <button
         type="button"
-        onclick={onclose}
-        title="Close (PR-12 will wire this up)"
+        onclick={() => onclose?.()}
+        title="Close pane"
         aria-label="Close pane"
-        disabled
+        disabled={!onclose}
       >
         ✕
       </button>
@@ -455,6 +587,126 @@
           </li>
         {/each}
       </ul>
+    </div>
+  {/if}
+
+  {#if settingsOpen}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="pane-settings-backdrop" onclick={closeSettings}>
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <div class="pane-settings" data-testid="pane-settings" onclick={(e) => e.stopPropagation()}>
+        <h3>Pane settings</h3>
+        <label>
+          <span>Label</span>
+          <input type="text" bind:value={draftLabel} data-testid="pane-settings-label" />
+        </label>
+        <label>
+          <span>Command</span>
+          <input type="text" bind:value={draftCommand} data-testid="pane-settings-command" />
+        </label>
+        <label>
+          <span>Args (one per line)</span>
+          <textarea
+            bind:value={draftArgsRaw}
+            rows="3"
+            data-testid="pane-settings-args"
+            spellcheck="false"
+            autocapitalize="none"
+          ></textarea>
+        </label>
+        <label>
+          <span>Cwd</span>
+          <input type="text" bind:value={draftCwd} data-testid="pane-settings-cwd" />
+        </label>
+        <label>
+          <span>Env (KEY=value per line)</span>
+          <textarea bind:value={draftEnvRaw} rows="3" data-testid="pane-settings-env"></textarea>
+        </label>
+        <p class="pane-settings-hint">Command / args / cwd / env apply on next restart (Cmd+R).</p>
+        <div class="pane-settings-actions">
+          <button type="button" onclick={saveSettings} data-testid="pane-settings-save">
+            Save
+          </button>
+          <button type="button" onclick={closeSettings}>Cancel</button>
+        </div>
+        <hr />
+        {#if reorderHint}
+          <div class="pane-settings-actions secondary">
+            <button
+              type="button"
+              onclick={() => {
+                closeSettings();
+                onreorder?.(-1);
+              }}
+              disabled={!onreorder || !reorderHint.canPrev}
+              data-testid="pane-settings-move-prev"
+              title={reorderHint.direction === "row" ? "Move left" : "Move up"}
+            >
+              {reorderHint.direction === "row" ? "Move ←" : "Move ↑"}
+            </button>
+            <button
+              type="button"
+              onclick={() => {
+                closeSettings();
+                onreorder?.(1);
+              }}
+              disabled={!onreorder || !reorderHint.canNext}
+              data-testid="pane-settings-move-next"
+              title={reorderHint.direction === "row" ? "Move right" : "Move down"}
+            >
+              {reorderHint.direction === "row" ? "Move →" : "Move ↓"}
+            </button>
+          </div>
+        {/if}
+        <div class="pane-settings-actions secondary">
+          <button
+            type="button"
+            onclick={() => {
+              closeSettings();
+              onsplit?.("row", "after");
+            }}
+            disabled={!onsplit}
+            data-testid="pane-settings-split-right"
+          >
+            Split right
+          </button>
+          <button
+            type="button"
+            onclick={() => {
+              closeSettings();
+              onsplit?.("column", "after");
+            }}
+            disabled={!onsplit}
+            data-testid="pane-settings-split-down"
+          >
+            Split down
+          </button>
+          <button
+            type="button"
+            onclick={() => {
+              closeSettings();
+              onduplicate?.();
+            }}
+            disabled={!onduplicate}
+            data-testid="pane-settings-duplicate"
+          >
+            Duplicate
+          </button>
+          <button
+            type="button"
+            class="danger"
+            onclick={() => {
+              closeSettings();
+              onclose?.();
+            }}
+            disabled={!onclose}
+            data-testid="pane-settings-close"
+          >
+            Close pane
+          </button>
+        </div>
+      </div>
     </div>
   {/if}
 </div>
