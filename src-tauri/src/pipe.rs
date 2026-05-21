@@ -447,12 +447,24 @@ impl PipeRegistry {
                 chunk.to_vec()
             };
             state.pending_line.extend_from_slice(&bytes);
-            // Cap the buffer so an interactive shell that never emits \n
-            // can't grow per-rule memory without bound. Past the cap we
-            // flush as-is and reset.
+
+            // Buffer-cap escape hatch: a producer that never emits `\n`
+            // (animated progress bars, one huge JSON blob) would grow
+            // `pending_line` without bound. Treat the dumped contents as a
+            // single line and run it through the normal dispatch path so
+            // the bytes still reach the target / ring / accumulator — the
+            // previous implementation dropped them entirely.
             if state.pending_line.len() > PENDING_BUFFER_CAP {
                 let dump = std::mem::take(&mut state.pending_line);
-                process_complete_lines(state, &dump, now, &mut fired_events);
+                dispatch_line(
+                    &self.pty,
+                    state,
+                    &dump,
+                    now,
+                    &mut fired_events,
+                    &mut auto_disabled,
+                    &mut target_gone,
+                );
             }
 
             // Split off all complete lines and route them.
@@ -462,52 +474,18 @@ impl PipeRegistry {
                 // semantics — onExit / tailPeriodic reproduce it verbatim;
                 // the lineRealtime path passes the line (without newline)
                 // through `build_send_payload`, which adds its own.
-                let had_nl = line.ends_with(b"\n");
-                if had_nl {
+                if line.ends_with(b"\n") {
                     line.pop();
                 }
-                if !include_excluded(state, &line) {
-                    continue;
-                }
-                if let Some(re) = &state.match_re {
-                    if !re.is_match(&String::from_utf8_lossy(&line)) {
-                        continue;
-                    }
-                }
-
-                let mut dispatched = true;
-                match &state.rule.mode {
-                    PipeMode::LineRealtime | PipeMode::RegexMatch { .. } => {
-                        let body = String::from_utf8_lossy(&line).into_owned();
-                        let payload =
-                            build_send_payload(&body, PIPE_BRACKETED_PASTE, PIPE_TRAILING_NEWLINE);
-                        if let Err(e) = self.pty.write(&state.rule.target, &payload) {
-                            if e.to_string().contains("unknown pty id") {
-                                target_gone.push(TargetGonePayload {
-                                    rule_id: state.rule.id.clone(),
-                                    target: state.rule.target.clone(),
-                                });
-                            }
-                            dispatched = false;
-                        }
-                    }
-                    PipeMode::TailPeriodic { .. } => {
-                        // Match the line into the ring; the ticker flushes.
-                        let cap = state.ring_capacity();
-                        if cap > 0 {
-                            if state.ring.len() == cap {
-                                state.ring.pop_front();
-                            }
-                            state.ring.push_back(line.clone());
-                        }
-                    }
-                    PipeMode::OnExit => {
-                        state.accumulator.push(line.clone());
-                    }
-                }
-                if dispatched {
-                    record_fire(state, now, &mut fired_events, &mut auto_disabled);
-                }
+                dispatch_line(
+                    &self.pty,
+                    state,
+                    &line,
+                    now,
+                    &mut fired_events,
+                    &mut auto_disabled,
+                    &mut target_gone,
+                );
             }
         }
 
@@ -646,18 +624,61 @@ fn include_excluded(state: &RuleState, line: &[u8]) -> bool {
     true
 }
 
-fn process_complete_lines(
+/// Apply include/exclude + match filters, then route the line to the rule's
+/// mode-specific sink. `record_fire` only runs when bytes were *actually
+/// delivered to the target PTY* — buffered lines (TailPeriodic ring,
+/// OnExit accumulator) are NOT counted as fires here, because that would
+/// trip the runtime auto-disable on heavy sources before a single periodic
+/// flush could happen and would also leave `pipe:fired.count` measuring
+/// "lines buffered" instead of "lines delivered". The actual fire is
+/// recorded at flush time in [`PipeRegistry::tick_periodic`] and
+/// [`PipeRegistry::on_pane_exit`].
+fn dispatch_line(
+    pty: &PtyRegistry,
     state: &mut RuleState,
-    bytes: &[u8],
+    line: &[u8],
     now: Instant,
     fired: &mut Vec<FiredPayload>,
+    auto_disabled: &mut Vec<AutoDisabledPayload>,
+    target_gone: &mut Vec<TargetGonePayload>,
 ) {
-    // Used only by the buffer-cap escape hatch; treat the dumped bytes as a
-    // single line. Auto-disable tracking is intentionally skipped here —
-    // overflow is its own bug class and shouldn't be conflated with the
-    // runaway counter.
-    let _ = (bytes, now, fired);
-    state.pending_line.clear();
+    if !include_excluded(state, line) {
+        return;
+    }
+    if let Some(re) = &state.match_re {
+        if !re.is_match(&String::from_utf8_lossy(line)) {
+            return;
+        }
+    }
+    match &state.rule.mode {
+        PipeMode::LineRealtime | PipeMode::RegexMatch { .. } => {
+            let body = String::from_utf8_lossy(line).into_owned();
+            let payload = build_send_payload(&body, PIPE_BRACKETED_PASTE, PIPE_TRAILING_NEWLINE);
+            match pty.write(&state.rule.target, &payload) {
+                Ok(()) => record_fire(state, now, fired, auto_disabled),
+                Err(e) => {
+                    if e.to_string().contains("unknown pty id") {
+                        target_gone.push(TargetGonePayload {
+                            rule_id: state.rule.id.clone(),
+                            target: state.rule.target.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        PipeMode::TailPeriodic { .. } => {
+            let cap = state.ring_capacity();
+            if cap > 0 {
+                if state.ring.len() == cap {
+                    state.ring.pop_front();
+                }
+                state.ring.push_back(line.to_vec());
+            }
+        }
+        PipeMode::OnExit => {
+            state.accumulator.push(line.to_vec());
+        }
+    }
 }
 
 fn record_fire(
@@ -1192,6 +1213,141 @@ mod tests {
         // Camel-case + tagged enum on the wire.
         assert!(json.contains("\"intervalMs\":250"));
         assert!(json.contains("\"kind\":\"tailPeriodic\""));
+    }
+
+    #[test]
+    fn tail_periodic_buffering_does_not_trip_auto_disable() {
+        // Regression: observe_chunk used to call record_fire for every line
+        // pushed into the ring, so a noisy source with a tailPeriodic rule
+        // would auto-disable BEFORE the ticker ever flushed. The rule must
+        // stay enabled after a large burst — only the ticker's actual
+        // delivery should count as a fire.
+        let (reg, _pty, sink) = pipe_fixture();
+        let r = rule(
+            "r-tail",
+            "pane-src",
+            "pane-dst-missing",
+            PipeMode::TailPeriodic {
+                lines: 3,
+                interval_ms: 60_000,
+            },
+        );
+        reg.upsert(r).unwrap();
+
+        // 200 lines is well past the 50-in-2s auto-disable threshold.
+        let mut blob = Vec::new();
+        for i in 0..200 {
+            blob.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        reg.observe_chunk("pane-src", &blob);
+
+        assert!(
+            sink.auto_disabled.lock().unwrap().is_empty(),
+            "buffering must not trip auto-disable; events: {:?}",
+            *sink.auto_disabled.lock().unwrap()
+        );
+        assert!(
+            sink.fired.lock().unwrap().is_empty(),
+            "pipe:fired should not emit until a periodic flush actually delivers"
+        );
+        assert!(reg.list()[0].enabled, "rule must remain enabled");
+    }
+
+    #[test]
+    fn on_exit_buffering_preserves_accumulator_under_load() {
+        // Regression: observe_chunk used to call record_fire for every
+        // appended line, so a noisy onExit source could auto-disable mid-
+        // run AND have its accumulator wiped by `record_fire`'s
+        // auto-disable branch — losing every byte that was supposed to
+        // flush on exit. After the fix, buffering is silent and the
+        // accumulator survives until on_pane_exit.
+        let (reg, _pty, sink) = pipe_fixture();
+        reg.upsert(rule(
+            "r-exit",
+            "pane-src",
+            "pane-dst-missing",
+            PipeMode::OnExit,
+        ))
+        .unwrap();
+
+        let mut blob = Vec::new();
+        for i in 0..200 {
+            blob.extend_from_slice(format!("entry {i}\n").as_bytes());
+        }
+        reg.observe_chunk("pane-src", &blob);
+
+        assert!(
+            sink.auto_disabled.lock().unwrap().is_empty(),
+            "onExit buffering must not auto-disable"
+        );
+        assert!(reg.list()[0].enabled, "rule still enabled");
+
+        // Now exit — the accumulator should flush as one payload.
+        reg.on_pane_exit("pane-src");
+        assert_eq!(
+            sink.target_gone.lock().unwrap().len(),
+            1,
+            "exit fires once even after a heavy burst"
+        );
+    }
+
+    #[test]
+    fn line_realtime_overflow_dispatches_instead_of_dropping() {
+        // Regression: when `pending_line` exceeded PENDING_BUFFER_CAP
+        // without seeing a `\n`, the previous implementation discarded the
+        // bytes via a no-op `process_complete_lines`. They must reach the
+        // target instead — losing data silently for noisy sources is the
+        // worst kind of failure mode.
+        let (reg, _pty, sink) = pipe_fixture();
+        reg.upsert(rule(
+            "r-big",
+            "pane-src",
+            "pane-dst-missing",
+            PipeMode::LineRealtime,
+        ))
+        .unwrap();
+
+        // > PENDING_BUFFER_CAP (16 KiB) bytes, no newline. After the fix
+        // the dispatcher attempts a write to the missing target → one
+        // `targetGone` event. The previous implementation produced zero
+        // events because the bytes never reached `dispatch_line`.
+        let blob = vec![b'A'; PENDING_BUFFER_CAP + 4096];
+        reg.observe_chunk("pane-src", &blob);
+
+        assert_eq!(
+            sink.target_gone.lock().unwrap().len(),
+            1,
+            "overflow bytes must take the dispatch path"
+        );
+    }
+
+    #[test]
+    fn tail_periodic_overflow_keeps_data_in_the_ring() {
+        // The buffer-cap escape hatch must funnel oversized chunks through
+        // the same dispatch_line path for tailPeriodic too — so a flush
+        // afterwards still has data to send. Before the fix the dumped
+        // bytes vanished and the ring was empty.
+        let (reg, _pty, sink) = pipe_fixture();
+        let r = rule(
+            "r-ring",
+            "pane-src",
+            "pane-dst-missing",
+            PipeMode::TailPeriodic {
+                lines: 5,
+                interval_ms: 1,
+            },
+        );
+        reg.upsert(r).unwrap();
+        let blob = vec![b'X'; PENDING_BUFFER_CAP + 1024];
+        reg.observe_chunk("pane-src", &blob);
+        // Sleep past intervalMs so the ticker fires immediately.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        reg.tick_periodic();
+        assert_eq!(
+            sink.target_gone.lock().unwrap().len(),
+            1,
+            "the overflowed payload should be the line tail-periodic flushes"
+        );
     }
 
     // Sanity that bracketed-paste markers actually frame realtime writes —
