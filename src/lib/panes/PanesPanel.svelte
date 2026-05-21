@@ -70,6 +70,12 @@
   // different pane.
   let drafts: Record<string, Draft> = $state({});
   let activeId: string = $state("");
+  // Tracks whether the previous render had the modal open, so the seed
+  // effect can distinguish "user just opened the modal" from "panes
+  // prop changed while open" (e.g. Save triggered a store update). The
+  // former reseeds everything; the latter only reconciles additions /
+  // removals so unsaved drafts on other tabs survive.
+  let wasOpen = false;
 
   /** Build a fresh draft from the live pane spec. The args / env raw
    *  strings mirror the form's textareas — keeping them as separate
@@ -87,23 +93,56 @@
     };
   }
 
-  // Re-seed drafts whenever the modal opens. Tab switching uses the
-  // already-seeded drafts so unsaved edits survive.
+  // Seed drafts only on the open: false -> true transition. Subsequent
+  // `panes` updates (Save round-trip, pane split / close from another
+  // surface) reconcile without wiping unsaved drafts:
+  //   - new pane ids get a fresh draft
+  //   - drafts for vanished pane ids are dropped
+  //   - if the active tab vanished, fall back to the first remaining one
   $effect(() => {
     if (!open) {
-      drafts = {};
+      if (wasOpen) {
+        drafts = {};
+        activeId = "";
+      }
+      wasOpen = false;
       return;
     }
-    const next: Record<string, Draft> = {};
-    for (const row of panes) {
-      next[row.id] = freshDraft(row);
+
+    if (!wasOpen) {
+      wasOpen = true;
+      const next: Record<string, Draft> = {};
+      for (const row of panes) {
+        next[row.id] = freshDraft(row);
+      }
+      drafts = next;
+      activeId =
+        initialPaneId && panes.some((p) => p.id === initialPaneId)
+          ? initialPaneId
+          : (panes[0]?.id ?? "");
+      return;
     }
-    drafts = next;
-    const initial =
-      initialPaneId && panes.some((p) => p.id === initialPaneId)
-        ? initialPaneId
-        : (panes[0]?.id ?? "");
-    activeId = initial;
+
+    // Modal already open — reconcile only.
+    const ids = new Set(panes.map((p) => p.id));
+    let mutated = false;
+    const next = { ...drafts };
+    for (const row of panes) {
+      if (next[row.id] === undefined) {
+        next[row.id] = freshDraft(row);
+        mutated = true;
+      }
+    }
+    for (const id of Object.keys(next)) {
+      if (!ids.has(id)) {
+        delete next[id];
+        mutated = true;
+      }
+    }
+    if (mutated) drafts = next;
+    if (!ids.has(activeId)) {
+      activeId = panes[0]?.id ?? "";
+    }
   });
 
   const activePane = $derived(panes.find((p) => p.id === activeId));

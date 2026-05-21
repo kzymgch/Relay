@@ -114,6 +114,101 @@ describe("PanesPanel", () => {
     expect(labelBack.value).toBe("Edited 1");
   });
 
+  it("Save doesn't snap back to initialPaneId or wipe other tabs' drafts", async () => {
+    // Regression: a prior $effect reseeded drafts + activeId on every
+    // `panes` / `initialPaneId` change. Because the parent re-renders
+    // with a fresh `panes` array (and initialPaneId still pointing at
+    // the focused pane) after `onupdatemeta`, Save snapped the active
+    // tab back to Pane 1 and discarded the user's draft on every other
+    // tab.
+    const onupdatemeta = vi.fn();
+    const props = defaultProps({ onupdatemeta });
+    const { container, rerender } = render(PanesPanel, { props: props as never });
+
+    // User picks Pane 2 and starts editing it.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-pane-2"]') as HTMLElement
+    );
+    await fireEvent.input(
+      container.querySelector('[data-testid="panes-field-label"]') as HTMLInputElement,
+      { target: { value: "Logs (in-flight)" } }
+    );
+    // User also leaves an unsaved edit on Pane 1.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-pane-1"]') as HTMLElement
+    );
+    await fireEvent.input(
+      container.querySelector('[data-testid="panes-field-label"]') as HTMLInputElement,
+      { target: { value: "Editor (in-flight)" } }
+    );
+
+    // Back to Pane 2 and hit Save.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-pane-2"]') as HTMLElement
+    );
+    await fireEvent.input(
+      container.querySelector('[data-testid="panes-field-label"]') as HTMLInputElement,
+      { target: { value: "Logs" } }
+    );
+    await fireEvent.click(container.querySelector('[data-testid="panes-save"]') as HTMLElement);
+    expect(onupdatemeta).toHaveBeenCalledWith("pane-2", expect.objectContaining({ label: "Logs" }));
+
+    // Parent reflects the save by handing us a refreshed `panes` array.
+    const refreshed = basePanes().map((p) => (p.id === "pane-2" ? { ...p, label: "Logs" } : p));
+    await rerender({ ...props, panes: refreshed } as never);
+
+    // Active tab is still Pane 2 (not snapped back to initialPaneId="pane-1").
+    expect(
+      (
+        container.querySelector('[data-testid="panes-tab-pane-2"]') as HTMLElement
+      ).classList.contains("active")
+    ).toBe(true);
+    // Pane 1's unsaved draft survives the Save round-trip.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-pane-1"]') as HTMLElement
+    );
+    expect(
+      (container.querySelector('[data-testid="panes-field-label"]') as HTMLInputElement).value
+    ).toBe("Editor (in-flight)");
+  });
+
+  it("Newly-added panes get a fresh tab; removed panes drop their draft and shift active away", async () => {
+    const props = defaultProps();
+    const { container, rerender } = render(PanesPanel, { props: props as never });
+    // Move active to pane-3 and edit it.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-pane-3"]') as HTMLElement
+    );
+    await fireEvent.input(
+      container.querySelector('[data-testid="panes-field-label"]') as HTMLInputElement,
+      { target: { value: "Going away" } }
+    );
+
+    // Layout change: pane-3 is closed, pane-4 is added.
+    const trimmed: PaneRow[] = [
+      ...basePanes().filter((p) => p.id !== "pane-3"),
+      {
+        id: "pane-4",
+        label: "Pane 4",
+        command: "/bin/zsh",
+        args: ["-l"],
+        reorderHint: null,
+        isSsh: false,
+      },
+    ];
+    await rerender({ ...props, panes: trimmed } as never);
+
+    // pane-3 tab is gone, pane-4 tab appears with the spec's label.
+    expect(container.querySelector('[data-testid="panes-tab-pane-3"]')).toBeNull();
+    expect(container.querySelector('[data-testid="panes-tab-pane-4"]')).not.toBeNull();
+    // Active fell back to the first remaining pane.
+    expect(
+      (
+        container.querySelector('[data-testid="panes-tab-pane-1"]') as HTMLElement
+      ).classList.contains("active")
+    ).toBe(true);
+  });
+
   it("Save emits onupdatemeta for the active pane only", async () => {
     const onupdatemeta = vi.fn();
     const { container } = render(PanesPanel, {
