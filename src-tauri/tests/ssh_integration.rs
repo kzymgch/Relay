@@ -9,11 +9,67 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::Mutex;
+
+use relay_lib::bridge::{spawn_ssh, EventSink, PtyRegistry, SshState, SshStatus};
+use relay_lib::pty::ExitStatus;
 use relay_lib::ssh::{SshAuth, SshConnectConfig, SshSession};
 use russh::keys::ssh_key;
 use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
+
+/// Simple in-memory event sink used to assert on the bridge's lifecycle
+/// events without standing up a Tauri runtime.
+#[derive(Default)]
+struct CapturingSink {
+    data: Mutex<Vec<(String, Vec<u8>)>>,
+    exits: Mutex<Vec<(String, ExitStatus)>>,
+    statuses: Mutex<Vec<(String, SshStatus, u32)>>,
+}
+
+impl CapturingSink {
+    fn exit_count(&self, id: &str) -> usize {
+        self.exits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == id)
+            .count()
+    }
+    fn last_exit(&self, id: &str) -> Option<ExitStatus> {
+        self.exits
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(p, _)| p == id)
+            .map(|(_, s)| *s)
+    }
+    fn ssh_statuses(&self, id: &str) -> Vec<(SshStatus, u32)> {
+        self.statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(p, s, a)| if p == id { Some((*s, *a)) } else { None })
+            .collect()
+    }
+}
+
+impl EventSink for CapturingSink {
+    fn emit_data(&self, pane_id: &str, data: Vec<u8>) {
+        self.data.lock().unwrap().push((pane_id.into(), data));
+    }
+    fn emit_exit(&self, pane_id: &str, status: ExitStatus) {
+        self.exits.lock().unwrap().push((pane_id.into(), status));
+    }
+    fn emit_ssh_status(&self, pane_id: &str, status: SshStatus, attempt: u32) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .push((pane_id.into(), status, attempt));
+    }
+}
 
 struct TestServer;
 
@@ -170,6 +226,151 @@ async fn ssh_session_roundtrip_against_embedded_server() {
     panic!(
         "expected to observe 'echo:ping' in output; got {:?}",
         String::from_utf8_lossy(&buf)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_initiated_kill_reports_clean_exit() {
+    // The bridge's SSH supervisor uses `ExitStatus::success` to distinguish
+    // user-initiated teardown (clean: do not reconnect) from a network drop
+    // (dirty: enter the backoff loop). If this property regresses, closing
+    // an SSH pane would trigger a futile reconnect attempt.
+    let port = start_test_server().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut session = SshSession::connect(SshConnectConfig {
+        host: "127.0.0.1".into(),
+        port,
+        user: "testuser".into(),
+        auth: SshAuth::Password("any".into()),
+        cols: 80,
+        rows: 24,
+        term: "xterm-256color".into(),
+        output_buffer_chunks: 32,
+        connect_timeout: Duration::from_secs(5),
+    })
+    .await
+    .expect("ssh connect");
+
+    let _output_rx = session.take_output_rx().expect("output rx");
+    let exit_rx = session.take_exit_rx().expect("exit rx");
+
+    session.kill().expect("kill");
+
+    let status = tokio::time::timeout(Duration::from_secs(5), exit_rx)
+        .await
+        .expect("exit timeout")
+        .expect("exit rx closed");
+    assert!(
+        status.success,
+        "user-initiated kill should produce a success-coded exit (got {status:?})"
+    );
+    assert_eq!(
+        status.code, 0,
+        "user kill should report code 0, not the disconnect sentinel"
+    );
+}
+
+/// User closing an SSH pane while it is live must result in exactly one
+/// `pty:exit` event (success-coded), no reconnect attempts, and clean
+/// teardown of the supervisor task. Regression coverage for the bug where
+/// `pty_kill` raced the backoff sleep and produced spurious "reconnecting"
+/// status emits before the pane disappeared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_treats_user_kill_as_clean_shutdown() {
+    use std::sync::Arc;
+
+    let port = start_test_server().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let registry = Arc::new(PtyRegistry::new());
+    let sink: Arc<CapturingSink> = Arc::new(CapturingSink::default());
+    let ssh_state = Arc::new(SshState::new());
+
+    let id = "pane-kill".to_string();
+    spawn_ssh(
+        registry.clone(),
+        sink.clone(),
+        Vec::new(),
+        ssh_state.clone(),
+        id.clone(),
+        SshConnectConfig {
+            host: "127.0.0.1".into(),
+            port,
+            user: "kill-tester".into(),
+            auth: SshAuth::Password("any".into()),
+            cols: 80,
+            rows: 24,
+            term: "xterm-256color".into(),
+            output_buffer_chunks: 32,
+            connect_timeout: Duration::from_secs(5),
+        },
+        true,
+    )
+    .await
+    .expect("spawn_ssh");
+
+    // Wait for the `Connected` status — that's our signal the supervisor
+    // is past initial connect and parked in `drain_until_exit`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let connected = sink
+            .ssh_statuses(&id)
+            .iter()
+            .any(|(s, _)| *s == SshStatus::Connected);
+        if connected {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never observed Connected status; got {:?}",
+            sink.ssh_statuses(&id)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Simulate `pty_kill` for an SSH pane: signal shutdown, then kill via
+    // the registry. The kill path sends `SshCommand::Kill` to the pump,
+    // which reports `success: true`; the supervisor sees that AND the
+    // shutdown flag, both routes terminate without reconnect.
+    ssh_state.signal_shutdown(&id);
+    registry.kill(&id).expect("kill");
+
+    // Wait for the supervisor to finalize and emit pty:exit.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if sink.exit_count(&id) > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "supervisor never emitted pty:exit after kill"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Give the supervisor a moment in case it spuriously tries to reconnect
+    // — any subsequent Reconnecting / Connecting status emit is a bug.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let exit = sink.last_exit(&id).expect("exit observed");
+    assert!(
+        exit.success,
+        "user kill should produce success-coded exit, got {exit:?}"
+    );
+    assert_eq!(
+        sink.exit_count(&id),
+        1,
+        "exactly one pty:exit expected; got {} events: {:?}",
+        sink.exit_count(&id),
+        sink.exits.lock().unwrap()
+    );
+    let statuses = sink.ssh_statuses(&id);
+    assert!(
+        !statuses
+            .iter()
+            .any(|(s, _)| matches!(s, SshStatus::Reconnecting | SshStatus::Disconnected)),
+        "user kill must not trigger Disconnected / Reconnecting; saw {statuses:?}"
     );
 }
 

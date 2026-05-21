@@ -487,7 +487,7 @@ pub async fn spawn_pty(
     let id_for_task = id.clone();
 
     tokio::spawn(async move {
-        run_pane_io(
+        let exit = drain_until_exit(
             sink_for_task.as_ref(),
             observers_for_task.as_slice(),
             &id_for_task,
@@ -495,19 +495,28 @@ pub async fn spawn_pty(
             exit_rx,
         )
         .await;
+        // Local PTY panes have no reconnect path, so finalize unconditionally.
+        if let Some(status) = exit {
+            finalize_pane_exit(
+                sink_for_task.as_ref(),
+                observers_for_task.as_slice(),
+                &id_for_task,
+                status,
+            );
+        }
         let _ = registry_for_task.take(&id_for_task);
     });
 
     Ok(())
 }
 
-/// Drive a pane's data-forwarding and exit-handling lifecycle.
-///
-/// Used by both PTY and SSH spawn paths to keep observer fan-out and exit
-/// ordering identical. For SSH panes, the outer reconnect coordinator wraps
-/// this call: if exit signals a non-clean disconnect, the coordinator opens
-/// a new session and calls `run_pane_io` again with the new receivers.
-async fn run_pane_io(
+/// Forward output chunks to the sink/observers until the source's reader
+/// side closes, then await the exit status. **Does not** fire observer
+/// `on_exit` callbacks or emit a `pty:exit` event — that's the caller's
+/// job. Splitting this out lets the SSH supervisor reuse the data-pumping
+/// machinery across reconnect attempts without prematurely telling the
+/// frontend (and `onExit` pipe rules) that the pane is gone.
+async fn drain_until_exit(
     sink: &dyn EventSink,
     observers: &[Arc<dyn PaneOutputSink>],
     pane_id: &str,
@@ -515,30 +524,48 @@ async fn run_pane_io(
     exit_rx: oneshot::Receiver<ExitStatus>,
 ) -> Option<ExitStatus> {
     forward_loop(sink, observers, pane_id, output_rx).await;
-    let exit = exit_rx.await.ok();
-    // Fire `on_exit` on every observer BEFORE the caller drops the registry
-    // entry so onExit pipe rules can still consult the source pane's
-    // metadata and call `PtyRegistry::write` on their (still-live) targets.
-    if let Some(status) = exit {
-        for obs in observers {
-            obs.on_exit(pane_id, status);
-        }
-        sink.emit_exit(pane_id, status);
+    exit_rx.await.ok()
+}
+
+/// Fire `on_exit` on every observer and emit the `pty:exit` event. Called
+/// when the pane is truly done — a clean local-PTY exit, a clean SSH
+/// logout, a user-initiated kill, or SSH reconnect attempts exhausted.
+/// Observers run BEFORE the caller drops the registry entry so onExit pipe
+/// rules can still consult the source pane's metadata and call
+/// `PtyRegistry::write` on their (still-live) targets.
+fn finalize_pane_exit(
+    sink: &dyn EventSink,
+    observers: &[Arc<dyn PaneOutputSink>],
+    pane_id: &str,
+    status: ExitStatus,
+) {
+    for obs in observers {
+        obs.on_exit(pane_id, status);
     }
-    exit
+    sink.emit_exit(pane_id, status);
 }
 
 // ---------------------------------------------------------------------------
 // SSH spawn + reconnect
 // ---------------------------------------------------------------------------
 
-/// Per-pane SSH state owned by the reconnect coordinator. The frontend
-/// triggers reconnect via the `ssh_reconnect` Tauri command, which sets the
-/// signal so the coordinator wakes immediately instead of waiting for the
-/// next backoff tick.
+/// Per-pane SSH state owned by the reconnect coordinator. Two roles:
+///
+/// - `notify` lets the frontend's `ssh_reconnect` command interrupt the
+///   supervisor's backoff sleep immediately.
+/// - `shutdown` lets `pty_kill` (and any other "user really wants this pane
+///   gone" path) tell the supervisor not to attempt reconnect — otherwise
+///   a manual close while in the middle of a backoff window would race
+///   `registry.take()` against `registry.swap_ssh()` and the user would see
+///   a futile "reconnecting" status flash before the pane disappeared.
 #[derive(Default)]
 pub struct SshState {
-    waiters: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    inner: Mutex<HashMap<String, PerPane>>,
+}
+
+struct PerPane {
+    notify: Arc<tokio::sync::Notify>,
+    shutdown: bool,
 }
 
 impl SshState {
@@ -546,23 +573,47 @@ impl SshState {
         Self::default()
     }
 
-    fn waiter(&self, id: &str) -> Arc<tokio::sync::Notify> {
-        let mut guard = self.waiters.lock().expect("SshState poisoned");
+    fn slot(&self, id: &str) -> Arc<tokio::sync::Notify> {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
         guard
             .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .or_insert_with(|| PerPane {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                shutdown: false,
+            })
+            .notify
             .clone()
     }
 
     pub fn signal_reconnect(&self, id: &str) {
-        let guard = self.waiters.lock().expect("SshState poisoned");
-        if let Some(notify) = guard.get(id) {
-            notify.notify_waiters();
+        let guard = self.inner.lock().expect("SshState poisoned");
+        if let Some(s) = guard.get(id) {
+            s.notify.notify_waiters();
         }
     }
 
-    fn drop_waiter(&self, id: &str) {
-        let mut guard = self.waiters.lock().expect("SshState poisoned");
+    /// Mark the pane as being torn down by the user (close button, restart,
+    /// app exit). Wakes the backoff sleep so the supervisor can observe the
+    /// flag and bail without another reconnect attempt.
+    pub fn signal_shutdown(&self, id: &str) {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
+        if let Some(s) = guard.get_mut(id) {
+            s.shutdown = true;
+            s.notify.notify_waiters();
+        }
+    }
+
+    fn is_shutdown(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("SshState poisoned")
+            .get(id)
+            .map(|s| s.shutdown)
+            .unwrap_or(false)
+    }
+
+    fn drop_slot(&self, id: &str) {
+        let mut guard = self.inner.lock().expect("SshState poisoned");
         guard.remove(id);
     }
 }
@@ -624,33 +675,57 @@ async fn ssh_supervisor(
     initial_exit_rx: oneshot::Receiver<ExitStatus>,
     auto_reconnect: bool,
 ) {
-    let reconnect_notify = ssh_state.waiter(&id);
+    let reconnect_notify = ssh_state.slot(&id);
     let mut current_rx = Some((initial_output_rx, initial_exit_rx));
     let cfg = initial_cfg;
 
-    loop {
-        let (output_rx, exit_rx) = current_rx.take().expect("rx pair present");
-        let exit = run_pane_io(sink.as_ref(), observers.as_slice(), &id, output_rx, exit_rx).await;
+    // The exit status we eventually hand to `finalize_pane_exit`. Holds the
+    // *real* status the user should see in the UI — clean shell logout,
+    // user kill, or "all retries exhausted" sentinel.
+    let final_status: Option<ExitStatus>;
 
-        // A clean exit (code 0) means the user typed `exit` in the remote
-        // shell — honour it like a PTY exit and tear down. Anything else
-        // (drop, kill, timeout, error) is an "unexpected disconnect" and is
-        // eligible for reconnect.
-        let clean_exit = exit.map(|s| s.success).unwrap_or(false);
-        if !auto_reconnect || clean_exit {
+    'outer: loop {
+        let (output_rx, exit_rx) = current_rx.take().expect("rx pair present");
+        let exit =
+            drain_until_exit(sink.as_ref(), observers.as_slice(), &id, output_rx, exit_rx).await;
+
+        let user_kill = ssh_state.is_shutdown(&id);
+        // SshSession::pump marks user-initiated kills with `success: true`;
+        // network disconnects come back as `success: false` (typically
+        // `code = u32::MAX`). A `success: true` exit from the remote shell
+        // (user typed `exit`) is also treated as final.
+        let clean = exit.map(|s| s.success).unwrap_or(false);
+
+        if !auto_reconnect || clean || user_kill {
+            final_status = exit;
             break;
         }
 
+        // Disconnect → reconnect. Crucially: do *not* fire `on_exit`
+        // observers or emit `pty:exit` here. The pane is logically still
+        // alive; the frontend's `currentPtyId` must stay attached so the
+        // upcoming `ssh:status` / `pty:data` events route correctly.
         sink.emit_ssh_status(&id, SshStatus::Disconnected, 0);
 
         let mut policy = BackoffPolicy::default().iter();
-        let mut reconnected = false;
         while let Some((attempt, delay)) = policy.next_attempt() {
             sink.emit_ssh_status(&id, SshStatus::Reconnecting, attempt);
-            // Either the backoff delay elapses or the user clicked Reconnect.
+            // Wake either when the backoff elapses or when the user clicks
+            // Reconnect — the latter is also how `signal_shutdown` reaches
+            // us, in which case `is_shutdown()` returns true below.
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = reconnect_notify.notified() => {}
+            }
+            if ssh_state.is_shutdown(&id) {
+                // User closed the pane during the wait. No reconnect, no
+                // synthetic exit emit — the kill path already removed the
+                // registry entry and pty:exit fires once below.
+                final_status = Some(ExitStatus {
+                    code: 0,
+                    success: true,
+                });
+                break 'outer;
             }
             sink.emit_ssh_status(&id, SshStatus::Connecting, attempt);
             match SshSession::connect(cfg.clone()).await {
@@ -658,39 +733,41 @@ async fn ssh_supervisor(
                     let new_output = session.take_output_rx().expect("output rx present");
                     let new_exit = session.take_exit_rx().expect("exit rx present");
                     if let Err(e) = registry.swap_ssh(&id, session) {
+                        // Most likely cause: the entry was removed by a
+                        // concurrent `pty_kill`. Treat that as a clean
+                        // shutdown — the user wanted this pane gone.
                         eprintln!("relay-ssh: swap_ssh for {id} failed: {e}");
-                        break;
+                        final_status = Some(ExitStatus {
+                            code: 0,
+                            success: true,
+                        });
+                        break 'outer;
                     }
                     sink.emit_ssh_status(&id, SshStatus::Connected, attempt);
                     current_rx = Some((new_output, new_exit));
-                    reconnected = true;
-                    break;
+                    continue 'outer;
                 }
                 Err(e) => {
                     eprintln!("relay-ssh: reconnect attempt {attempt} failed: {e}");
-                    sink.emit_ssh_status(&id, SshStatus::Reconnecting, attempt);
                 }
             }
         }
 
-        if !reconnected {
-            // Out of attempts — emit a synthetic exit so the frontend's
-            // existing `pty:exit` handler tears the pane down. run_pane_io
-            // already emitted the real exit; surface another so the UI
-            // leaves the "reconnecting" state if it was lingering.
-            sink.emit_exit(
-                &id,
-                ExitStatus {
-                    code: u32::MAX,
-                    success: false,
-                },
-            );
-            break;
-        }
+        // All attempts exhausted — finalize with a non-success exit so the
+        // frontend leaves the reconnecting state and the pane settles into
+        // "exited".
+        final_status = Some(ExitStatus {
+            code: u32::MAX,
+            success: false,
+        });
+        break;
     }
 
+    if let Some(status) = final_status {
+        finalize_pane_exit(sink.as_ref(), observers.as_slice(), &id, status);
+    }
     let _ = registry.take(&id);
-    ssh_state.drop_waiter(&id);
+    ssh_state.drop_slot(&id);
 }
 
 async fn forward_loop(
@@ -850,10 +927,15 @@ fn build_ssh_auth(
         None
     };
     match (target.identity_path.as_ref(), keychain_password) {
-        (Some(path), Some(password)) => Ok(SshAuth::KeyOrPassword {
+        // A single Keychain entry serves two roles: passphrase for an
+        // encrypted private key, *and* password fallback if the server
+        // refuses key auth. Without this, every encrypted key would fail
+        // (`load_secret_key(..., None)` can't decrypt) and the user would
+        // have to set up plaintext keys to get SSH panes working.
+        (Some(path), Some(secret)) => Ok(SshAuth::KeyOrPassword {
             path: path.clone(),
-            passphrase: None,
-            password,
+            passphrase: Some(secret.clone()),
+            password: secret,
         }),
         (Some(path), None) => Ok(SshAuth::Key {
             path: path.clone(),
@@ -932,7 +1014,19 @@ pub fn pty_resize(
 }
 
 #[tauri::command]
-pub fn pty_kill(state: State<'_, BridgeState>, id: String) -> Result<(), String> {
+pub fn pty_kill(
+    state: State<'_, BridgeState>,
+    ssh_state: State<'_, Arc<SshState>>,
+    id: String,
+) -> Result<(), String> {
+    // For SSH panes, tell the supervisor we want a real teardown before the
+    // registry entry disappears. Without this, a kill issued while the
+    // supervisor is in its backoff sleep would race: the supervisor would
+    // wake, attempt to connect, then fail `swap_ssh` because the entry was
+    // already taken — emitting a useless "reconnecting" flash along the way.
+    if state.registry.get_ssh(&id).is_some() {
+        ssh_state.signal_shutdown(&id);
+    }
     state.registry.kill(&id).map_err(|e| e.to_string())
 }
 
@@ -998,9 +1092,26 @@ mod tests {
     use std::time::Instant;
 
     #[derive(Debug, Clone)]
+    // The bridge unit tests don't currently assert on captured `SshStatus`
+    // events — the supervisor's status/exit ordering is exercised end-to-end
+    // by the integration test (`supervisor_treats_user_kill_as_clean_shutdown`).
+    // The variant exists here so test sinks can faithfully record the event
+    // stream without the production code paying a runtime cost.
+    #[allow(dead_code)]
     enum TestEvent {
-        Data { pane_id: String, data: Vec<u8> },
-        Exit { pane_id: String, status: ExitStatus },
+        Data {
+            pane_id: String,
+            data: Vec<u8>,
+        },
+        Exit {
+            pane_id: String,
+            status: ExitStatus,
+        },
+        SshStatus {
+            pane_id: String,
+            status: SshStatus,
+            attempt: u32,
+        },
     }
 
     #[derive(Default)]
@@ -1042,6 +1153,14 @@ mod tests {
             self.events.lock().unwrap().push(TestEvent::Exit {
                 pane_id: pane_id.to_string(),
                 status,
+            });
+        }
+
+        fn emit_ssh_status(&self, pane_id: &str, status: SshStatus, attempt: u32) {
+            self.events.lock().unwrap().push(TestEvent::SshStatus {
+                pane_id: pane_id.to_string(),
+                status,
+                attempt,
             });
         }
     }

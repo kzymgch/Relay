@@ -304,7 +304,7 @@ async fn pump(
     mut cmd_rx: mpsc::Receiver<SshCommand>,
 ) {
     let mut pending_exit_code: Option<u32> = None;
-    let mut eof_observed = false;
+    let mut user_killed = false;
     loop {
         tokio::select! {
             msg = channel.wait() => {
@@ -326,12 +326,10 @@ async fn pump(
                         pending_exit_code = Some(exit_status);
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
-                        eof_observed = true;
                         break;
                     }
                     Some(_) => {}
                     None => {
-                        eof_observed = true;
                         break;
                     }
                 }
@@ -352,7 +350,14 @@ async fn pump(
                             eprintln!("relay-ssh: window_change failed: {e}");
                         }
                     }
+                    // Explicit Kill = user-initiated teardown (close button,
+                    // restart, app exit). Reported back as `success: true`
+                    // so the bridge supervisor treats this as a clean
+                    // shutdown and doesn't enter the reconnect loop. `None`
+                    // (sender dropped) also means the SshSession was dropped
+                    // by its owner — same intent.
                     Some(SshCommand::Kill) | None => {
+                        user_killed = true;
                         break;
                     }
                 }
@@ -367,15 +372,22 @@ async fn pump(
         .disconnect(Disconnect::ByApplication, "relay closing", "en-US")
         .await;
 
-    let status = match (pending_exit_code, eof_observed) {
-        (Some(code), _) => ExitStatus {
+    let status = match (user_killed, pending_exit_code) {
+        // User asked us to close: clean shutdown, no reconnect.
+        (true, _) => ExitStatus {
+            code: 0,
+            success: true,
+        },
+        // Remote shell sent an explicit exit status: respect it (a 0 means
+        // the user logged out cleanly; non-zero means the shell died but
+        // didn't disconnect, which still counts as a final exit).
+        (false, Some(code)) => ExitStatus {
             code,
             success: code == 0,
         },
-        // No exit status from the peer (network drop / kill). Mirror Pty's
-        // u32::MAX sentinel and surface as a non-success exit so the bridge
-        // can trigger reconnect on the SSH-pane code path.
-        (None, _) => ExitStatus {
+        // No exit status, no kill — network drop. Surface as non-success
+        // so the bridge triggers reconnect on the SSH-pane code path.
+        (false, None) => ExitStatus {
             code: u32::MAX,
             success: false,
         },
