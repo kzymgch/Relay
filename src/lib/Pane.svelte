@@ -38,20 +38,50 @@
   let exitInfo: { code: number; success: boolean } | null = $state(null);
   let errorMessage: string | undefined = $state();
   let api: TerminalApi | undefined = $state();
-  let ptyId: PtyId | undefined = $state();
+
+  // Non-reactive bookkeeping. `currentPtyId` is the id our listeners route to
+  // right now; setting it to `undefined` instantly detaches the listeners
+  // from any in-flight PTY (e.g. during restart). `destroyed` lets async
+  // continuations after `await` notice the component has unmounted and bail
+  // out before installing listeners or registering a fresh PTY.
+  let currentPtyId: PtyId | undefined;
+  let destroyed = false;
   let unlistenData: (() => void) | undefined;
   let unlistenExit: (() => void) | undefined;
 
   const encoder = new TextEncoder();
 
-  async function clearListeners() {
-    unlistenData?.();
-    unlistenExit?.();
-    unlistenData = undefined;
-    unlistenExit = undefined;
+  async function installListeners() {
+    // Listeners are installed once for the lifetime of the pane and filter
+    // by `currentPtyId`. This avoids losing the very first `pty:data` /
+    // `pty:exit` from short-lived processes that race the JS subscription.
+    const dataDispose = await onPtyData((id, data) => {
+      if (id === currentPtyId) api?.write(data);
+    });
+    if (destroyed) {
+      dataDispose();
+      return false;
+    }
+    unlistenData = dataDispose;
+
+    const exitDispose = await onPtyExit((id, code, success) => {
+      if (id === currentPtyId) {
+        status = "exited";
+        exitInfo = { code, success };
+      }
+    });
+    if (destroyed) {
+      exitDispose();
+      unlistenData?.();
+      unlistenData = undefined;
+      return false;
+    }
+    unlistenExit = exitDispose;
+    return true;
   }
 
   async function spawn() {
+    if (destroyed) return;
     status = "spawning";
     exitInfo = null;
     errorMessage = undefined;
@@ -62,59 +92,74 @@
       cfg.rows = api.rows;
     }
 
+    let id: PtyId;
     try {
-      const id = await spawnPty(cfg);
-      ptyId = id;
-      status = "running";
-
-      unlistenData = await onPtyData((emittedId, data) => {
-        if (emittedId === id) {
-          api?.write(data);
-        }
-      });
-      unlistenExit = await onPtyExit((emittedId, code, success) => {
-        if (emittedId === id) {
-          status = "exited";
-          exitInfo = { code, success };
-        }
-      });
+      id = await spawnPty(cfg);
     } catch (e) {
+      if (destroyed) return;
       status = "error";
       errorMessage = e instanceof Error ? e.message : String(e);
+      return;
     }
+
+    if (destroyed) {
+      // The pane unmounted while we were waiting on the backend. Don't
+      // attach the new id; tell the backend to drop the PTY too.
+      void killPty(id).catch(() => {
+        // Best-effort — backend will GC on app exit anyway.
+      });
+      return;
+    }
+
+    currentPtyId = id;
+    status = "running";
+  }
+
+  async function init() {
+    if (!(await installListeners())) return;
+    await spawn();
   }
 
   function handleTerminalReady(a: TerminalApi) {
     api = a;
-    void spawn();
+    void init();
   }
 
   function handleData(data: string) {
-    if (ptyId && status === "running") {
-      writePty(ptyId, encoder.encode(data)).catch((e: unknown) => {
+    if (currentPtyId && status === "running") {
+      writePty(currentPtyId, encoder.encode(data)).catch((e: unknown) => {
         console.error("[pane] pty_write failed", e);
       });
     }
   }
 
   function handleResize(cols: number, rows: number) {
-    if (ptyId && status === "running") {
-      resizePty(ptyId, cols, rows).catch((e: unknown) => {
+    if (currentPtyId && status === "running") {
+      resizePty(currentPtyId, cols, rows).catch((e: unknown) => {
         console.error("[pane] pty_resize failed", e);
       });
     }
   }
 
   async function restart() {
-    if (ptyId && status === "running") {
+    if (destroyed) return;
+    // Detach listeners from the old PTY synchronously so its pending events
+    // (including the imminent pty:exit from the kill) don't bleed into the
+    // new pane state.
+    const oldId = currentPtyId;
+    currentPtyId = undefined;
+    status = "spawning";
+    exitInfo = null;
+    errorMessage = undefined;
+
+    if (oldId) {
       try {
-        await killPty(ptyId);
+        await killPty(oldId);
       } catch (e) {
         console.warn("[pane] kill during restart failed", e);
       }
     }
-    await clearListeners();
-    ptyId = undefined;
+    if (destroyed) return;
     api?.clear();
     await spawn();
   }
@@ -133,9 +178,14 @@
 
   onMount(() => {
     return () => {
-      const id = ptyId;
-      void clearListeners();
-      if (id && status === "running") {
+      destroyed = true;
+      unlistenData?.();
+      unlistenExit?.();
+      unlistenData = undefined;
+      unlistenExit = undefined;
+      const id = currentPtyId;
+      currentPtyId = undefined;
+      if (id) {
         killPty(id).catch(() => {
           // Best-effort cleanup; the backend will GC on app exit anyway.
         });

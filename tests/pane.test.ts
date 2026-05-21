@@ -35,7 +35,7 @@ vi.mock("@tauri-apps/api/event", async () => {
 
 import Pane from "../src/lib/Pane.svelte";
 import { getXtermState, resetXtermMocks } from "./_xterm-mocks";
-import { emitTauriEvent, resetTauriEventListeners } from "./_tauri-event-mock";
+import { emitTauriEvent, listenerCount, resetTauriEventListeners } from "./_tauri-event-mock";
 
 interface InvocationLog {
   cmd: string;
@@ -232,5 +232,77 @@ describe("Pane component", () => {
     expect(container.querySelector('[data-testid="pane-error"]')?.textContent).toContain(
       "/bin/nope: not found"
     );
+  });
+
+  it("installs pty:data / pty:exit listeners before pty_spawn is issued", async () => {
+    // Short-lived processes can emit data and exit before the JS listener
+    // would have been attached if it were installed only after spawnPty
+    // resolves. Hold spawn pending and verify listeners are already live by
+    // the time pty_spawn appears in the invocation log.
+    let spawnResolve: ((id: string) => void) | undefined;
+    mockIPC((cmd, args) => {
+      invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      if (cmd === "pty_spawn") {
+        return new Promise<string>((resolve) => {
+          spawnResolve = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    render(Pane, {
+      props: { label: "x", command: "/bin/echo", args: ["hi"] },
+    });
+
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+
+    // At the moment pty_spawn is in flight, both listeners are already
+    // registered. If they weren't, the backend's immediate `pty:data` /
+    // `pty:exit` from a fast-exiting process would slip through.
+    expect(listenerCount("pty:data")).toBe(1);
+    expect(listenerCount("pty:exit")).toBe(1);
+
+    // Cleanup.
+    spawnResolve?.("pane-late");
+  });
+
+  it("kills the late-arrived PTY when unmount races with spawn", async () => {
+    let spawnResolve: ((id: string) => void) | undefined;
+    mockIPC((cmd, args) => {
+      invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      if (cmd === "pty_spawn") {
+        return new Promise<string>((resolve) => {
+          spawnResolve = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const { unmount } = render(Pane, {
+      props: { label: "x", command: "/bin/sleep", args: ["10"] },
+    });
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+
+    unmount();
+
+    // Backend reports the spawn finally succeeded — after the pane is gone.
+    expect(spawnResolve).toBeDefined();
+    spawnResolve?.("pane-orphan");
+
+    // The post-await branch must detect `destroyed` and kill the late id so
+    // the PTY does not leak in the registry.
+    await vi.waitFor(() => {
+      const kill = invocations.find((i) => i.cmd === "pty_kill");
+      expect(kill).toBeDefined();
+      expect((kill as InvocationLog).args.id).toBe("pane-orphan");
+    });
+
+    // No listener should remain attached to the dead pane.
+    expect(listenerCount("pty:data")).toBe(0);
+    expect(listenerCount("pty:exit")).toBe(0);
   });
 });
