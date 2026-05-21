@@ -36,16 +36,16 @@ function captureWith<T>(responder?: (cmd: string, args: Record<string, unknown>)
 }
 
 describe("pty bridge wrapper", () => {
-  it("spawnPty forwards the config and returns the paneId", async () => {
-    captureWith((cmd) => (cmd === "pty_spawn" ? "pane-42" : undefined));
+  it("spawnPty forwards the JS-allocated id and the config", async () => {
+    captureWith();
     const config: PtySpawnConfig = {
+      id: "pane-42",
       command: "/bin/echo",
       args: ["hi"],
       cols: 80,
       rows: 24,
     };
-    const id = await spawnPty(config);
-    expect(id).toBe("pane-42");
+    await spawnPty(config);
     expect(calls).toEqual([{ cmd: "pty_spawn", args: { config } }]);
   });
 
