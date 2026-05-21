@@ -1,0 +1,65 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+export type PaneId = string;
+
+export interface PtySpawnConfig {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  cols?: number;
+  rows?: number;
+}
+
+export interface PtyDataPayload {
+  paneId: PaneId;
+  data: number[];
+}
+
+export interface PtyExitPayload {
+  paneId: PaneId;
+  code: number;
+  success: boolean;
+}
+
+export const PTY_DATA_EVENT = "pty:data";
+export const PTY_EXIT_EVENT = "pty:exit";
+
+export async function spawnPty(config: PtySpawnConfig): Promise<PaneId> {
+  return invoke<PaneId>("pty_spawn", { config });
+}
+
+export async function writePty(id: PaneId, data: Uint8Array): Promise<void> {
+  await invoke("pty_write", { id, data: Array.from(data) });
+}
+
+export async function resizePty(id: PaneId, cols: number, rows: number): Promise<void> {
+  await invoke("pty_resize", { id, cols, rows });
+}
+
+export async function killPty(id: PaneId): Promise<void> {
+  await invoke("pty_kill", { id });
+}
+
+/** Convert the on-the-wire `pty:data` payload into a typed view. */
+export function parsePtyData(payload: PtyDataPayload): { paneId: PaneId; data: Uint8Array } {
+  return { paneId: payload.paneId, data: new Uint8Array(payload.data) };
+}
+
+export async function onPtyData(
+  handler: (paneId: PaneId, data: Uint8Array) => void
+): Promise<UnlistenFn> {
+  return listen<PtyDataPayload>(PTY_DATA_EVENT, (event) => {
+    const parsed = parsePtyData(event.payload);
+    handler(parsed.paneId, parsed.data);
+  });
+}
+
+export async function onPtyExit(
+  handler: (paneId: PaneId, code: number, success: boolean) => void
+): Promise<UnlistenFn> {
+  return listen<PtyExitPayload>(PTY_EXIT_EVENT, (event) => {
+    handler(event.payload.paneId, event.payload.code, event.payload.success);
+  });
+}
