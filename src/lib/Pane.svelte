@@ -89,7 +89,12 @@
     errorMessage = undefined;
 
     // Generate the id and commit `currentPtyId` *before* the network call.
-    // From this point on, listeners route bridge-emitted events to us.
+    // From this point on, listeners route bridge-emitted events to us. The
+    // id also doubles as a generation token: if another spawn() (or
+    // restart()) has moved `currentPtyId` to a different value by the time
+    // this `await spawnPty(cfg)` resumes, we must not mutate the pane
+    // state — otherwise a stale success or failure would clobber the
+    // newer session's spawning / running state.
     const id = crypto.randomUUID();
     currentPtyId = id;
 
@@ -99,23 +104,31 @@
       cfg.rows = api.rows;
     }
 
+    let spawnError: unknown;
     try {
       await spawnPty(cfg);
     } catch (e) {
-      if (destroyed) return;
-      status = "error";
-      errorMessage = e instanceof Error ? e.message : String(e);
-      currentPtyId = undefined;
+      spawnError = e;
+    }
+
+    // Two reasons we might not be the active session any more:
+    //   - the pane was unmounted
+    //   - restart() / a later spawn() advanced `currentPtyId`
+    // Either way, leave state mutations to the active session and clean up
+    // any orphan PTY the backend spawned for us.
+    if (destroyed || currentPtyId !== id) {
+      if (!spawnError) {
+        void killPty(id).catch(() => {
+          // Best-effort — backend will GC on app exit anyway.
+        });
+      }
       return;
     }
 
-    if (destroyed) {
-      // The pane unmounted while we were waiting on the backend. Tell the
-      // backend to drop the PTY too.
+    if (spawnError) {
+      status = "error";
+      errorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
       currentPtyId = undefined;
-      void killPty(id).catch(() => {
-        // Best-effort — backend will GC on app exit anyway.
-      });
       return;
     }
 

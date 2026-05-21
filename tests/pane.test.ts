@@ -357,6 +357,111 @@ describe("Pane component", () => {
     });
   });
 
+  it("ignores a stale spawn success when restart races", async () => {
+    // Hold both spawn calls open so we can settle them in the wrong order
+    // and confirm the stale (first) response cannot flip the pane to
+    // running once a newer session has started.
+    let firstResolve: (() => void) | undefined;
+    let secondResolve: (() => void) | undefined;
+    let spawnCount = 0;
+    mockIPC((cmd, args) => {
+      invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      if (cmd === "pty_spawn") {
+        spawnCount += 1;
+        if (spawnCount === 1) {
+          return new Promise<void>((resolve) => {
+            firstResolve = resolve;
+          });
+        }
+        if (spawnCount === 2) {
+          return new Promise<void>((resolve) => {
+            secondResolve = resolve;
+          });
+        }
+      }
+      return undefined;
+    });
+
+    const { container } = render(Pane, {
+      props: { label: "x", command: "/bin/zsh" },
+    });
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+
+    const restartBtn = container.querySelector(
+      'button[aria-label="Restart pane"]'
+    ) as HTMLButtonElement;
+    await fireEvent.click(restartBtn);
+
+    await vi.waitFor(() => {
+      expect(invocations.filter((i) => i.cmd === "pty_spawn").length).toBeGreaterThanOrEqual(2);
+    });
+
+    // Stale success must not flip the pane to running.
+    firstResolve?.();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(container.querySelector(".status-running")).toBeNull();
+    expect(container.querySelector(".status-spawning")).not.toBeNull();
+
+    // The current session decides the transition.
+    secondResolve?.();
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+  });
+
+  it("ignores a stale spawn failure when restart races", async () => {
+    let firstReject: ((err: unknown) => void) | undefined;
+    let secondResolve: (() => void) | undefined;
+    let spawnCount = 0;
+    mockIPC((cmd, args) => {
+      invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      if (cmd === "pty_spawn") {
+        spawnCount += 1;
+        if (spawnCount === 1) {
+          return new Promise<void>((_, reject) => {
+            firstReject = reject;
+          });
+        }
+        if (spawnCount === 2) {
+          return new Promise<void>((resolve) => {
+            secondResolve = resolve;
+          });
+        }
+      }
+      return undefined;
+    });
+
+    const { container } = render(Pane, {
+      props: { label: "x", command: "/bin/zsh" },
+    });
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+
+    const restartBtn = container.querySelector(
+      'button[aria-label="Restart pane"]'
+    ) as HTMLButtonElement;
+    await fireEvent.click(restartBtn);
+
+    await vi.waitFor(() => {
+      expect(invocations.filter((i) => i.cmd === "pty_spawn").length).toBeGreaterThanOrEqual(2);
+    });
+
+    // Stale failure must not flip the pane to error.
+    firstReject?.(new Error("stale spawn failure"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(container.querySelector(".status-error")).toBeNull();
+    expect(container.querySelector(".status-spawning")).not.toBeNull();
+
+    // The current session decides the transition.
+    secondResolve?.();
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+  });
+
   it("focuses the terminal when mounted with focused=true", async () => {
     // The initial layout starts with one pane already selected; that pane
     // should not require a click to capture keystrokes.
