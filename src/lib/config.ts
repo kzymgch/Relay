@@ -7,6 +7,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { defaultLoggingConfig, type LoggingConfig } from "./logging";
+
+export type { LoggingConfig };
+
 export interface FontConfig {
   family: string;
   size: number;
@@ -54,6 +58,7 @@ export interface RelayConfig {
   send: SendConfig;
   scrollback: ScrollbackConfig;
   session: SessionSettings;
+  logging: LoggingConfig;
   keybind: Record<string, string>;
   defaultPane: PaneSpecConfig;
   pane: PaneSection;
@@ -72,6 +77,7 @@ export function defaultConfig(): RelayConfig {
     send: { bracketedPaste: true, trailingNewline: false },
     scrollback: { lines: 10_000, persistOnExit: false, persistMaxBytes: 1024 * 1024 },
     session: { autosaveOnExit: true, restoreOnLaunch: true },
+    logging: defaultLoggingConfig(),
     keybind: {},
     defaultPane: {
       label: "Pane",

@@ -5,6 +5,7 @@ import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { SvelteMap } from "svelte/reactivity";
 
 import {
+  applySessionRules,
   deleteSession,
   installAutosave,
   listSessions,
@@ -17,6 +18,7 @@ import {
   writeAutosaveScrollback,
   type SessionData,
 } from "../src/lib/sessions";
+import type { PipeRule } from "../src/lib/pipe";
 import type { LayoutSnapshot } from "../src/lib/layout/tree";
 
 interface Call {
@@ -63,6 +65,7 @@ describe("serializeSession", () => {
         customLayouts: custom,
       },
       { bracketedPaste: true, trailingNewline: false },
+      [],
       "morning"
     );
     expect(data.layout.tree).toEqual(layout.tree);
@@ -120,6 +123,54 @@ describe("session command wrappers", () => {
     captureWith();
     await deleteSession("morning");
     expect(calls[0]).toEqual({ cmd: "session_delete", args: { name: "morning" } });
+  });
+
+  it("serializeSession carries pipe rules verbatim into the on-wire shape", () => {
+    const layout = fixtureLayout();
+    const rules: PipeRule[] = [
+      {
+        id: "r1",
+        source: "pane-a",
+        target: "pane-b",
+        enabled: true,
+        mode: { kind: "lineRealtime" },
+        include: "^send:",
+        exclude: null,
+        stripAnsi: true,
+      },
+    ];
+    const data = serializeSession(
+      {
+        tree: layout.tree,
+        panes: layout.panes,
+        focusedPaneId: layout.focusedPaneId,
+        customLayouts: new SvelteMap<string, LayoutSnapshot>(),
+      },
+      { bracketedPaste: true, trailingNewline: false },
+      rules,
+      "noisy"
+    );
+    expect(data.rules).toEqual(rules);
+  });
+
+  it("applySessionRules forwards through pipe_replace_all", async () => {
+    captureWith();
+    const rules: PipeRule[] = [
+      {
+        id: "r1",
+        source: "pane-a",
+        target: "pane-b",
+        enabled: true,
+        mode: { kind: "lineRealtime" },
+        include: null,
+        exclude: null,
+        stripAnsi: true,
+      },
+    ];
+    await applySessionRules(rules);
+    const c = calls.find((x) => x.cmd === "pipe_replace_all");
+    expect(c).toBeDefined();
+    expect(c!.args.rules).toEqual(rules);
   });
 
   it("writeAutosave / readAutosave round-trip via the bridge", async () => {

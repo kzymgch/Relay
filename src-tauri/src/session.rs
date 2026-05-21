@@ -20,8 +20,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tauri::State;
+
+use crate::pipe::PipeRule;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,8 +42,11 @@ pub struct SessionData {
     /// Settings overrides recorded with the session (font size, send opts).
     /// Optional — most sessions inherit the global config.
     pub send_options: Option<serde_json::Value>,
-    /// Reserved for pipe rules — empty for now.
-    pub rules: Vec<serde_json::Value>,
+    /// Persisted pipe rules (spec §9). Older sessions stored arbitrary JSON
+    /// in this slot; the lenient deserializer below drops anything that
+    /// doesn't shape-match `PipeRule` so legacy files keep loading cleanly.
+    #[serde(deserialize_with = "deserialize_rules_lenient")]
+    pub rules: Vec<PipeRule>,
     /// Per-pane base64-or-binary scrollback dumps, opt-in. Keyed by pane id.
     /// Stored alongside (not inside) this file so a huge scrollback doesn't
     /// bloat the session JSON itself.
@@ -322,6 +327,26 @@ impl SessionStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Lenient deserializer for `SessionData.rules`. Reads each entry as a
+/// `serde_json::Value` first, then tries to deserialize into `PipeRule`;
+/// anything that fails the shape check is silently dropped. Lets us evolve
+/// the rule schema without invalidating older session files.
+fn deserialize_rules_lenient<'de, D>(d: D) -> Result<Vec<PipeRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<PipeRule>(v).ok())
+        // PipeRule has `#[serde(default)]` so a `{}` payload deserializes
+        // into an empty rule. Treat empty id / source / target as a sentinel
+        // for "not a real rule" so legacy junk doesn't materialise into a
+        // ghost rule the registry then has to reject.
+        .filter(|r| !r.id.is_empty() && !r.source.is_empty() && !r.target.is_empty())
+        .collect())
+}
+
 /// Minimal RFC3339 timestamp without pulling in `chrono`. Falls back to
 /// epoch-seconds-as-string if `SystemTime` can't be read.
 fn current_timestamp() -> String {
@@ -534,6 +559,41 @@ mod tests {
         assert_eq!(parsed.name, "legacy");
         assert!(parsed.rules.is_empty());
         assert!(parsed.scrollback_keys.is_empty());
+    }
+
+    #[test]
+    fn legacy_rules_with_unknown_shape_are_dropped() {
+        // Sessions written before pipe rules were typed put arbitrary JSON
+        // into the slot. The lenient deserializer must silently drop anything
+        // that doesn't deserialize as `PipeRule` instead of erroring the
+        // whole load.
+        let raw = r#"{
+            "layout": { "tree": { "kind": "leaf", "paneId": "a" }, "panes": {} },
+            "savedAt": "1700000000",
+            "name": "legacy",
+            "rules": [{"foo": "bar"}, {"alpha": 1}]
+        }"#;
+        let parsed: SessionData = serde_json::from_str(raw).expect("deserialize legacy");
+        assert!(parsed.rules.is_empty(), "shapeless rules should be dropped");
+    }
+
+    #[test]
+    fn typed_pipe_rules_round_trip() {
+        let (_dir, store) = fresh_store();
+        let mut data = sample_session();
+        data.rules = vec![crate::pipe::PipeRule {
+            id: "r1".into(),
+            source: "pane-a".into(),
+            target: "pane-b".into(),
+            enabled: true,
+            mode: crate::pipe::PipeMode::LineRealtime,
+            include: Some("^send:".into()),
+            exclude: None,
+            strip_ansi: true,
+        }];
+        store.save("with-rules", data.clone()).expect("save");
+        let back = store.load("with-rules").expect("load");
+        assert_eq!(back.rules, data.rules);
     }
 
     #[test]

@@ -8,9 +8,18 @@
 import { PRESETS } from "../layout/presets";
 import type { LayoutStore } from "../layout/store.svelte";
 import type { RelayConfig } from "../config";
+import type { PipeRule } from "../pipe";
 import type { SessionMetadata } from "../sessions";
 
-export type PaletteGroup = "pane" | "layout" | "session" | "send" | "view" | "settings";
+export type PaletteGroup =
+  | "pane"
+  | "layout"
+  | "session"
+  | "send"
+  | "view"
+  | "settings"
+  | "pipe"
+  | "logs";
 
 export interface PaletteAction {
   id: string;
@@ -31,6 +40,7 @@ export type SettingsSection =
   | "pane-presets"
   | "theme"
   | "keybind"
+  | "logging"
   | "import-export";
 
 export interface PaletteHooks {
@@ -52,12 +62,21 @@ export interface PaletteHooks {
   bumpFont(delta: number): void;
   /** Reset font size to its default. */
   resetFont(): void;
+  /** Open the pipe-rules modal (CRUD lives there, not in Settings). */
+  openPipeRules(): void;
+  /** Open the live-log tail for `paneId`. */
+  openLogs(paneId: string): void;
+  /** Flip a pipe rule's enabled flag through the Rust dispatcher. */
+  togglePipeRule(ruleId: string, enabled: boolean): Promise<void>;
 }
 
 export interface BuildActionsInput {
   store: LayoutStore;
   config: RelayConfig;
   sessions: readonly SessionMetadata[];
+  /** Pipe rules already loaded from the Rust registry; surfaced as
+   *  per-rule toggle entries in the palette. */
+  pipeRules: readonly PipeRule[];
   hooks: PaletteHooks;
 }
 
@@ -68,7 +87,7 @@ export interface BuildActionsInput {
  * order only matters for the empty-query view.
  */
 export function buildActions(input: BuildActionsInput): PaletteAction[] {
-  const { store, config, sessions, hooks } = input;
+  const { store, config, sessions, pipeRules, hooks } = input;
   const out: PaletteAction[] = [];
   const focusedId = store.focusedPaneId;
   const focused = store.panes[focusedId];
@@ -214,6 +233,7 @@ export function buildActions(input: BuildActionsInput): PaletteAction[] {
     { id: "pane-presets", label: "Settings: Pane presets" },
     { id: "theme", label: "Settings: Theme" },
     { id: "keybind", label: "Settings: Keybindings" },
+    { id: "logging", label: "Settings: Logging" },
     { id: "import-export", label: "Settings: Import / Export" },
   ];
   for (const s of sections) {
@@ -222,6 +242,37 @@ export function buildActions(input: BuildActionsInput): PaletteAction[] {
       label: s.label,
       group: "settings",
       run: () => hooks.openSettings(s.id),
+    });
+  }
+
+  // --- Pipe rules ---
+  out.push({
+    id: "pipe.open",
+    label: "Pipe rules…",
+    group: "pipe",
+    run: () => hooks.openPipeRules(),
+  });
+  for (const r of pipeRules) {
+    const src = store.panes[r.source]?.label ?? r.source;
+    const dst = store.panes[r.target]?.label ?? r.target;
+    out.push({
+      id: `pipe.toggle.${r.id}`,
+      label: `Toggle rule: ${src} → ${dst}`,
+      group: "pipe",
+      hint: r.enabled ? "on" : "off",
+      run: () => hooks.togglePipeRule(r.id, !r.enabled),
+    });
+  }
+
+  // --- Logs ---
+  for (const id of store.paneOrder) {
+    const spec = store.panes[id];
+    if (!spec) continue;
+    out.push({
+      id: `logs.open.${id}`,
+      label: `Logs: ${spec.label}…`,
+      group: "logs",
+      run: () => hooks.openLogs(id),
     });
   }
 

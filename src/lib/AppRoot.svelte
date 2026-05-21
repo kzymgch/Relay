@@ -11,6 +11,7 @@
   import { onConfigChanged, type RelayConfig, type ThemeConfig } from "./config";
   import type { ITheme } from "@xterm/xterm";
   import {
+    applySessionRules,
     clearAutosaveScrollback,
     deleteSession as deleteSessionRust,
     installAutosave,
@@ -34,6 +35,10 @@
     type SettingsSection,
   } from "./palette/actions";
   import SettingsPanel from "./settings/SettingsPanel.svelte";
+  import StatusBar from "./StatusBar.svelte";
+  import PipeRulesPanel from "./pipe/PipeRulesPanel.svelte";
+  import LogsPanel from "./logging/LogsPanel.svelte";
+  import { pipeList, pipeToggle, type PipeRule } from "./pipe";
   import "./app-root.css";
   import "./layout/splitter.css";
 
@@ -104,6 +109,15 @@
 
   let sendOptions: SendOptions = $state({ ...DEFAULT_SEND_OPTIONS });
   const history = new SendHistory();
+
+  // Pipe rules mirror the Rust registry. Refreshed on panel open, after
+  // every CRUD, and on session load. Drives the status-bar count and the
+  // palette's per-rule toggle entries.
+  let pipeRules: PipeRule[] = $state([]);
+
+  // Session name surfaced in the status bar. Set when a named session is
+  // saved or loaded; reset to empty when the user clears it.
+  let currentSessionName: string = $state("");
 
   // Sync UI state ← config in two places, never via `$effect`:
   //
@@ -192,6 +206,7 @@
         customLayouts: store.customLayouts,
       },
       sendOptions,
+      pipeRules,
       name
     );
   }
@@ -271,6 +286,18 @@
   let sessionCatalog: SessionMetadata[] = $state([]);
   let settingsOpen: boolean = $state(false);
   let settingsSection: SettingsSection | null = $state(null);
+  let pipePanelOpen: boolean = $state(false);
+  let logsPanelOpen: boolean = $state(false);
+  let logsPanelPaneId: string | null = $state(null);
+
+  async function refreshPipeRules(): Promise<void> {
+    try {
+      pipeRules = await pipeList();
+    } catch (e) {
+      console.error("[app] pipe_list failed", e);
+      pipeRules = [];
+    }
+  }
 
   async function refreshSessions(): Promise<void> {
     try {
@@ -297,6 +324,7 @@
       const data = snapshotSession(trimmed);
       data.scrollbackKeys = keys;
       await saveSessionRust(trimmed, data);
+      currentSessionName = trimmed;
       await refreshSessions();
     },
     async loadSession(name) {
@@ -322,9 +350,18 @@
           trailingNewline: data.sendOptions.trailingNewline,
         };
       }
+      // Push the session's recorded rules into the Rust dispatcher so the
+      // pipe registry reflects what was saved. We pull the new list back
+      // immediately so the status bar / palette refresh.
+      if (Array.isArray(data.rules)) {
+        await applySessionRules(data.rules);
+        await refreshPipeRules();
+      }
+      currentSessionName = name;
     },
     async deleteSession(name) {
       await deleteSessionRust(name);
+      if (currentSessionName === name) currentSessionName = "";
       await refreshSessions();
     },
     openSettings(section) {
@@ -339,14 +376,31 @@
       fontSize = DEFAULT_FONT_SIZE;
       persistFontSize(fontSize);
     },
+    openPipeRules() {
+      pipePanelOpen = true;
+    },
+    openLogs(paneId) {
+      logsPanelPaneId = paneId;
+      logsPanelOpen = true;
+    },
+    async togglePipeRule(ruleId, enabled) {
+      try {
+        await pipeToggle(ruleId, enabled);
+        await refreshPipeRules();
+      } catch (e) {
+        console.error("[app] pipe_toggle failed", e);
+      }
+    },
   };
 
   async function openPalette(): Promise<void> {
     await refreshSessions();
+    await refreshPipeRules();
     paletteActions = buildActions({
       store,
       config: config.current,
       sessions: sessionCatalog,
+      pipeRules,
       hooks: paletteHooks,
     });
     paletteOpen = true;
@@ -494,6 +548,9 @@
         history,
         sendOptions
       );
+      // Status bar surfaces "focused → target"; remember the target per
+      // source so a follow-up focus jump still shows the prior pick.
+      store.recordSend(source, target);
     } catch (e) {
       console.error("[page] pty_send_text failed", e);
     }
@@ -665,11 +722,16 @@
                 trailingNewline: prev.sendOptions.trailingNewline,
               };
             }
+            if (Array.isArray(prev.rules)) {
+              await applySessionRules(prev.rules);
+            }
           }
         } catch {
           /* ignore restore failures */
         }
       }
+
+      await refreshPipeRules();
 
       teardownAutosave = installAutosave({
         snapshot: () => snapshotSession(),
@@ -805,11 +867,46 @@
       />
     {/each}
   </div>
+  <StatusBar
+    focusedLabel={store.panes[store.focusedPaneId]?.label ?? ""}
+    sendTargetLabel={// Resolve the most recent send target for the focused source. The
+    // status bar shows null when the user hasn't sent anything yet
+    // (suppresses the "→" chip entirely).
+    (() => {
+      const tgt = store.lastSendTarget[store.focusedPaneId];
+      return tgt ? (store.panes[tgt]?.label ?? null) : null;
+    })()}
+    activeRuleCount={pipeRules.filter((r) => r.enabled).length}
+    sessionName={currentSessionName}
+  />
   <CommandPalette open={paletteOpen} actions={paletteActions} onclose={closePalette} />
   <SettingsPanel
     open={settingsOpen}
     {config}
     initialSection={settingsSection}
     onclose={() => (settingsOpen = false)}
+  />
+  <PipeRulesPanel
+    open={pipePanelOpen}
+    panes={store.paneOrder.flatMap((id) => {
+      const spec = store.panes[id];
+      return spec ? [{ id, label: spec.label }] : [];
+    })}
+    onrulesChanged={(next) => {
+      pipeRules = [...next];
+    }}
+    onclose={() => {
+      pipePanelOpen = false;
+      void refreshPipeRules();
+    }}
+  />
+  <LogsPanel
+    open={logsPanelOpen}
+    paneId={logsPanelPaneId}
+    paneLabel={logsPanelPaneId ? (store.panes[logsPanelPaneId]?.label ?? "") : ""}
+    onclose={() => {
+      logsPanelOpen = false;
+      logsPanelPaneId = null;
+    }}
   />
 </div>

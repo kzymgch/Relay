@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type { LayoutSnapshot } from "./layout/tree";
+import { pipeReplaceAll, type PipeRule } from "./pipe";
 import type { SendOptions } from "./send";
 
 export interface LayoutPayload {
@@ -21,8 +22,9 @@ export interface LayoutPayload {
 export interface SessionData {
   layout: LayoutPayload;
   sendOptions: SendOptions | null;
-  /** Reserved — empty for now; pipe rules ship in a later phase. */
-  rules: unknown[];
+  /** Pipe rules captured at save time. Restored into the Rust dispatcher
+   * via `pipeReplaceAll` when the session loads. */
+  rules: PipeRule[];
   /** Names of panes whose scrollback was dumped to disk for this session. */
   scrollbackKeys: string[];
   savedAt: string;
@@ -45,6 +47,7 @@ export interface LayoutSourceForSave {
 export function serializeSession(
   layout: LayoutSourceForSave,
   sendOptions: SendOptions,
+  rules: PipeRule[],
   name = ""
 ): SessionData {
   const customLayouts: Record<string, LayoutSnapshot> = {};
@@ -59,11 +62,25 @@ export function serializeSession(
       customLayouts,
     },
     sendOptions,
-    rules: [],
+    rules,
     scrollbackKeys: [],
     savedAt: "",
     name,
   };
+}
+
+/**
+ * Push the session's recorded pipe rules into the Rust dispatcher. Used by
+ * `loadSession` / autosave-restore so a saved rule set is live the moment
+ * the panes reappear. Failures are non-fatal — the rules list UI can fix
+ * up rejected rules manually.
+ */
+export async function applySessionRules(rules: readonly PipeRule[]): Promise<void> {
+  try {
+    await pipeReplaceAll([...rules]);
+  } catch (e) {
+    console.error("[sessions] pipeReplaceAll failed", e);
+  }
 }
 
 export async function saveSession(name: string, data: SessionData): Promise<void> {

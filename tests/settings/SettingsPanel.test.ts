@@ -316,4 +316,42 @@ describe("SettingsPanel", () => {
       expect(config.current.font.family).toBe("Iosevka");
     });
   });
+
+  it("Logging section round-trips enabled / mode / secrets through config_save", async () => {
+    captureWith();
+    const config = createConfigStore();
+    const { container } = render(SettingsPanel, {
+      props: { open: true, config, onclose: vi.fn() },
+    });
+    const enabled = container.querySelector(
+      '[data-testid="settings-logging-enabled"]'
+    ) as HTMLInputElement;
+    const mode = container.querySelector(
+      '[data-testid="settings-logging-mode"]'
+    ) as HTMLSelectElement;
+    const secrets = container.querySelector(
+      '[data-testid="settings-logging-secrets"]'
+    ) as HTMLTextAreaElement;
+    await fireEvent.click(enabled);
+    mode.value = "raw";
+    await fireEvent.change(mode);
+    await fireEvent.input(secrets, {
+      target: { value: "sk-[A-Za-z0-9]+\nbearer .+" },
+    });
+    await fireEvent.click(container.querySelector('[data-testid="settings-save"]') as HTMLElement);
+    await vi.waitFor(() => {
+      const save = calls.find((c) => c.cmd === "config_save");
+      expect(save).toBeDefined();
+      const cfg = save!.args.config as {
+        logging: {
+          enabled: boolean;
+          mode: string;
+          secrets: string[];
+        };
+      };
+      expect(cfg.logging.enabled).toBe(true);
+      expect(cfg.logging.mode).toBe("raw");
+      expect(cfg.logging.secrets).toEqual(["sk-[A-Za-z0-9]+", "bearer .+"]);
+    });
+  });
 });

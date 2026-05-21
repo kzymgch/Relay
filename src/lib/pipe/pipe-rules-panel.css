@@ -1,0 +1,80 @@
+.pipe-rules-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.pipe-rules-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+
+.pipe-rules-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.pipe-rules-table th,
+.pipe-rules-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  vertical-align: middle;
+}
+
+.pipe-rules-table th {
+  color: rgba(255, 255, 255, 0.55);
+  font-weight: 500;
+}
+
+.pipe-rules-form {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 6px 10px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  padding-top: 10px;
+}
+
+.pipe-rules-form label {
+  align-self: center;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.pipe-rules-form input,
+.pipe-rules-form select {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.pipe-rules-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.pipe-rules-toast {
+  background: rgba(220, 80, 80, 0.18);
+  border: 1px solid rgba(220, 80, 80, 0.4);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: rgba(255, 200, 200, 0.95);
+}
+
+.pipe-rules-empty {
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+  padding: 12px 4px;
+}
+
+.pipe-rules-table td.danger button {
+  color: rgba(220, 80, 80, 0.9);
+}
