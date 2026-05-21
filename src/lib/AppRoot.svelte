@@ -25,6 +25,20 @@
 
   let focusedId: PaneSlotId = $state("left");
 
+  // Global font size in CSS pixels. Cmd+/-/0 adjusts this and every Pane
+  // forwards it to xterm via its `fontSize` prop so the change applies in
+  // lock-step. The bounds keep the terminal usable (sub-8px is unreadable,
+  // 32px crowds out content on small windows).
+  const DEFAULT_FONT_SIZE = 13;
+  const MIN_FONT_SIZE = 8;
+  const MAX_FONT_SIZE = 32;
+  const FONT_STEP = 1;
+  let fontSize: number = $state(DEFAULT_FONT_SIZE);
+
+  function clampFontSize(n: number): number {
+    return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, n));
+  }
+
   // Pane handles registered via `onregister`. Plain object rather than $state
   // because we read them at the moment of action (keystroke / menu click);
   // no view needs to re-render when they change.
@@ -92,17 +106,75 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    // All shortcuts in this app are Cmd-based; bail early on anything else
+    // so unrelated typing (including ctrl-based zsh bindings inside the
+    // terminal) is never preempted.
+    if (!event.metaKey) return;
+    if (event.ctrlKey || event.altKey) return;
+
+    // Font size first: "+" / "_" naturally require Shift on US layouts, and
+    // we want Cmd++ to behave like Cmd+= regardless of how the key is
+    // surfaced to JS.
+    switch (event.key) {
+      case "=":
+      case "+":
+        event.preventDefault();
+        fontSize = clampFontSize(fontSize + FONT_STEP);
+        return;
+      case "-":
+      case "_":
+        event.preventDefault();
+        fontSize = clampFontSize(fontSize - FONT_STEP);
+        return;
+      case "0":
+        event.preventDefault();
+        fontSize = DEFAULT_FONT_SIZE;
+        return;
+    }
+
     // Cmd+Shift+1..N — send the focused pane's selection to pane N.
-    // We avoid stealing keys that don't both Meta and Shift to keep
-    // editor-style shortcuts (e.g. Cmd+1) free for PR-09.
-    if (!event.metaKey || !event.shiftKey) return;
-    if (event.altKey || event.ctrlKey) return;
+    if (event.shiftKey) {
+      const digit = Number.parseInt(event.key, 10);
+      if (Number.isFinite(digit) && digit >= 1 && digit <= panes.length) {
+        event.preventDefault();
+        void sendSelection(focusedId, panes[digit - 1]!.id);
+      }
+      // Other Cmd+Shift+* combos are reserved for later PRs (palette,
+      // settings, etc).
+      return;
+    }
+
+    // Cmd+1..N — focus pane N.
     const digit = Number.parseInt(event.key, 10);
-    if (!Number.isFinite(digit) || digit < 1 || digit > panes.length) return;
-    const target = panes[digit - 1];
-    if (!target) return;
-    event.preventDefault();
-    void sendSelection(focusedId, target.id);
+    if (Number.isFinite(digit) && digit >= 1 && digit <= panes.length) {
+      event.preventDefault();
+      focusedId = panes[digit - 1]!.id;
+      // The Pane's $effect on `focused` will pull xterm focus too, so we
+      // don't need to call handle.focus() explicitly.
+      return;
+    }
+
+    // Single-letter shortcuts dispatched against the focused pane.
+    const focused = handles[focusedId];
+    switch (event.key) {
+      case "k":
+      case "K":
+        event.preventDefault();
+        focused?.clear();
+        return;
+      case "r":
+      case "R":
+        // Prevent the browser's reload shortcut from torching the whole app
+        // even when there's no focused handle yet (during initial mount).
+        event.preventDefault();
+        focused?.restart();
+        return;
+      case "f":
+      case "F":
+        event.preventDefault();
+        focused?.openSearch();
+        return;
+    }
   }
 
   onMount(() => {
@@ -120,6 +192,7 @@
         label={pane.label}
         command={pane.command}
         args={pane.args}
+        {fontSize}
         focused={focusedId === pane.id}
         onfocus={() => (focusedId = pane.id)}
         sendTargets={sendTargetsFor(pane.id)}

@@ -184,6 +184,137 @@ describe("Page — inter-pane send", () => {
     expect(invocations.find((i) => i.cmd === "pty_send_text")).toBeUndefined();
   });
 
+  it("Cmd+1..3 moves keyboard focus across panes", async () => {
+    const { container } = await mountPage();
+    const instances = getXtermState().instances;
+    instances[0]!.focus.mockClear();
+    instances[1]!.focus.mockClear();
+    instances[2]!.focus.mockClear();
+
+    await fireEvent.keyDown(window, { key: "2", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[1]!.focus).toHaveBeenCalled();
+    });
+    const panes = Array.from(container.querySelectorAll(".pane")) as HTMLElement[];
+    expect(panes[1]!.classList.contains("focused")).toBe(true);
+
+    await fireEvent.keyDown(window, { key: "3", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[2]!.focus).toHaveBeenCalled();
+    });
+  });
+
+  it("Cmd+K clears the focused pane's terminal", async () => {
+    await mountPage();
+    const [left] = getXtermState().instances;
+    left!.clear.mockClear();
+    await fireEvent.keyDown(window, { key: "k", metaKey: true });
+    expect(left!.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("Cmd+R restarts the focused pane (kill + respawn)", async () => {
+    await mountPage();
+    invocations = [];
+    await fireEvent.keyDown(window, { key: "r", metaKey: true });
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_kill")).toBeDefined();
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+    const killIdx = invocations.findIndex((i) => i.cmd === "pty_kill");
+    const spawnIdx = invocations.findIndex((i) => i.cmd === "pty_spawn");
+    expect(killIdx).toBeLessThan(spawnIdx);
+    // Only the focused pane (left = pane-1) restarts.
+    expect((invocations[killIdx] as InvocationLog).args.id).toBe("pane-1");
+  });
+
+  it("Cmd+F opens the focused pane's search bar", async () => {
+    const { container } = await mountPage();
+    expect(container.querySelector('[data-testid="pane-search"]')).toBeNull();
+    await fireEvent.keyDown(window, { key: "f", metaKey: true });
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="pane-search"]')).not.toBeNull();
+    });
+    // It opens inside the focused (left) pane, not somewhere else.
+    const panes = Array.from(container.querySelectorAll(".pane")) as HTMLElement[];
+    expect(panes[0]!.querySelector('[data-testid="pane-search"]')).not.toBeNull();
+  });
+
+  it("Cmd+= / Cmd+- adjust font size on every pane in lock-step", async () => {
+    await mountPage();
+    const instances = getXtermState().instances;
+    const initial = instances[0]!.options.fontSize as number;
+    expect(typeof initial).toBe("number");
+
+    await fireEvent.keyDown(window, { key: "=", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[0]!.options.fontSize).toBe(initial + 1);
+    });
+    expect(instances[1]!.options.fontSize).toBe(initial + 1);
+    expect(instances[2]!.options.fontSize).toBe(initial + 1);
+
+    await fireEvent.keyDown(window, { key: "+", metaKey: true, shiftKey: true });
+    await vi.waitFor(() => {
+      expect(instances[0]!.options.fontSize).toBe(initial + 2);
+    });
+
+    await fireEvent.keyDown(window, { key: "-", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[0]!.options.fontSize).toBe(initial + 1);
+    });
+  });
+
+  it("Cmd+0 resets font size to the default", async () => {
+    await mountPage();
+    const instances = getXtermState().instances;
+    const initial = instances[0]!.options.fontSize as number;
+
+    await fireEvent.keyDown(window, { key: "=", metaKey: true });
+    await fireEvent.keyDown(window, { key: "=", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[0]!.options.fontSize).toBe(initial + 2);
+    });
+
+    await fireEvent.keyDown(window, { key: "0", metaKey: true });
+    await vi.waitFor(() => {
+      expect(instances[0]!.options.fontSize).toBe(initial);
+    });
+  });
+
+  it("font size clamps at the configured minimum so it can't go subzero", async () => {
+    await mountPage();
+    const instances = getXtermState().instances;
+    const initial = instances[0]!.options.fontSize as number;
+    for (let i = 0; i < 50; i++) {
+      await fireEvent.keyDown(window, { key: "-", metaKey: true });
+    }
+    const final = instances[0]!.options.fontSize as number;
+    expect(final).toBeGreaterThan(0);
+    expect(final).toBeLessThan(initial);
+  });
+
+  it("ignores letter shortcuts without Cmd so typing stays in the terminal", async () => {
+    await mountPage();
+    const [left] = getXtermState().instances;
+    left!.clear.mockClear();
+    invocations = [];
+
+    await fireEvent.keyDown(window, { key: "k" });
+    await fireEvent.keyDown(window, { key: "r" });
+    await fireEvent.keyDown(window, { key: "f" });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(left!.clear).not.toHaveBeenCalled();
+    expect(invocations.find((i) => i.cmd === "pty_kill")).toBeUndefined();
+  });
+
+  it("ignores Ctrl+letter so OS / shell shortcuts pass through to the terminal", async () => {
+    await mountPage();
+    const [left] = getXtermState().instances;
+    left!.clear.mockClear();
+    await fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(left!.clear).not.toHaveBeenCalled();
+  });
+
   it("right-click menu on pane 2 sends to pane 3 using pane 2's selection", async () => {
     const { container } = await mountPage();
     // Find the second pane (topRight) by its label.

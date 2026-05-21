@@ -521,6 +521,101 @@ describe("Pane component", () => {
     expect(container.querySelector('[data-testid="pane-send-menu"]')).toBeNull();
   });
 
+  it("handle.clear() proxies to the terminal's clear", async () => {
+    const onregister = vi.fn();
+    const { container } = await mountPane({ onregister });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const handle = onregister.mock.calls.at(-1)?.[0];
+    const term = getXtermState().instances.at(-1)!;
+    term.clear.mockClear();
+    handle.clear();
+    expect(term.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("handle.restart() kills then respawns the PTY", async () => {
+    const onregister = vi.fn();
+    const { container } = await mountPane({ onregister });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    invocations = [];
+    const handle = onregister.mock.calls.at(-1)?.[0];
+
+    handle.restart();
+
+    await vi.waitFor(() => {
+      expect(invocations.find((i) => i.cmd === "pty_kill")).toBeDefined();
+      expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
+    });
+    const killIdx = invocations.findIndex((i) => i.cmd === "pty_kill");
+    const spawnIdx = invocations.findIndex((i) => i.cmd === "pty_spawn");
+    expect(killIdx).toBeLessThan(spawnIdx);
+  });
+
+  it("handle.openSearch() shows the search bar and Esc closes it", async () => {
+    const onregister = vi.fn();
+    const { container } = await mountPane({ onregister });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const handle = onregister.mock.calls.at(-1)?.[0];
+
+    handle.openSearch();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="pane-search"]')).not.toBeNull();
+    });
+
+    const input = container.querySelector('[data-testid="pane-search"] input') as HTMLInputElement;
+    expect(input).toBeDefined();
+    await fireEvent.keyDown(input, { key: "Escape" });
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="pane-search"]')).toBeNull();
+    });
+  });
+
+  it("Enter in the search bar invokes findNext with the typed query", async () => {
+    const onregister = vi.fn();
+    const { container } = await mountPane({ onregister });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const handle = onregister.mock.calls.at(-1)?.[0];
+    handle.openSearch();
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="pane-search"]')).not.toBeNull();
+    });
+
+    const input = container.querySelector('[data-testid="pane-search"] input') as HTMLInputElement;
+    // The search bar is bound to its own state via `bind:value`. Setting the
+    // value plus an input event is what testing-library uses to drive the
+    // binding.
+    input.value = "needle";
+    await fireEvent.input(input);
+
+    const term = getXtermState().instances.at(-1)!;
+    const search = term.addons.find(
+      (a) => (a as { constructor: { name: string } }).constructor.name === "MockSearchAddon"
+    ) as { findNext: ReturnType<typeof vi.fn>; findPrevious: ReturnType<typeof vi.fn> };
+    search.findNext.mockClear();
+
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(search.findNext).toHaveBeenCalledWith("needle");
+
+    await fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(search.findPrevious).toHaveBeenCalledWith("needle");
+  });
+
+  it("fontSize prop propagates to xterm.options", async () => {
+    const { container } = await mountPane({ fontSize: 18 });
+    await vi.waitFor(() => {
+      expect(container.querySelector(".status-running")).not.toBeNull();
+    });
+    const term = getXtermState().instances.at(-1)!;
+    expect(term.options.fontSize).toBe(18);
+  });
+
   it("handle.getPtyId returns undefined after pty:exit", async () => {
     // Inter-pane send (PR-08 AppRoot.sendSelection) calls handle.getPtyId
     // at the moment of the send; a stale id would reach pty_send_text and

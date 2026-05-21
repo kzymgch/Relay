@@ -139,6 +139,56 @@
   background: #3a3a3a;
 }
 
+.pane-search {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+  font:
+    12px/1.2 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+}
+
+.pane-search input {
+  width: 180px;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #f6f6f6;
+  font: inherit;
+  padding: 2px 6px;
+}
+
+.pane-search input:focus {
+  outline: 1px solid #4c8df6;
+  outline-offset: -1px;
+}
+
+.pane-search button {
+  appearance: none;
+  background: transparent;
+  color: #d4d4d4;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pane-search button:hover {
+  background: #3a3a3a;
+}
+
 .pane-error {
   position: absolute;
   inset: 0;
