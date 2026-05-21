@@ -1,12 +1,25 @@
-/* Global app shell + 3-pane grid. Mirrors `relay-spec.md §5` "三画面"
- * preset (left full-height, right column split into two). Future
- * PR-10/-13 will replace this fixed grid with the tree layout model. */
+/* Global app shell + absolute-positioned pane layer. Driven by the layout
+ * tree's `rectsFor()` so the same DOM structure handles every layout
+ * (three-pane, horizontal-3, 2x2, custom, ...) and panes never have to
+ * re-mount when the tree changes — that would kill their PTYs.
+ *
+ * Z-index plan (kept in one place so phases 2-4 can layer cleanly):
+ *   1  .slot                   — pane wrapper
+ *   5  .splitter (phase 2)     — drag handle between adjacent siblings
+ *  10  .pane-menu-backdrop    — context menus over everything
+ */
 
-/* Split rather than `:global(html, body)`: esbuild's CSS minifier warns on
- * the combined form (it can't rewrite the comma-separated selector while
- * preserving the `:global` scope contract). */
-:global(html),
-:global(body) {
+/* Plain CSS imported via `import "./app-root.css"` is processed by Vite's
+ * standard CSS pipeline — not Svelte's <style> handler — so `:global(...)`
+ * here would be treated as an unknown pseudo-class and the browser would
+ * drop the entire selector (leaving body with its 8px default margin and
+ * `overflow: visible`, which produced a window scrollbar that clipped the
+ * rightmost pane's header buttons). Plain selectors are correct here.
+ *
+ * If we ever move this back into a `<style>` block in AppRoot.svelte, swap
+ * to `:global(html), :global(body) { ... }` because Svelte scopes by default. */
+html,
+body {
   margin: 0;
   padding: 0;
   height: 100vh;
@@ -16,20 +29,132 @@
   overflow: hidden;
 }
 
-.layout {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: 1fr 1fr;
-  grid-template-areas:
-    "left topRight"
-    "left bottomRight";
+.app-root {
+  display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
-  gap: 2px;
   background: #000;
 }
 
+.app-toolbar {
+  flex-shrink: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #2a2a2a;
+  color: #d4d4d4;
+  font:
+    12px/1.2 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+}
+
+.layout-menu {
+  position: relative;
+}
+
+.layout-menu-toggle {
+  appearance: none;
+  background: transparent;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.layout-menu-toggle:hover {
+  background: #2a2a2a;
+}
+
+.layout-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: transparent;
+}
+
+.layout-menu-list {
+  position: absolute;
+  top: 36px;
+  left: 8px;
+  min-width: 200px;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+  font:
+    12px/1.3 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: #d4d4d4;
+}
+
+.layout-menu-list .layout-menu-header {
+  padding: 4px 12px 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+}
+
+.layout-menu-list .layout-menu-divider {
+  height: 1px;
+  background: #1a1a1a;
+  margin: 4px 0;
+}
+
+.layout-menu-list button {
+  appearance: none;
+  display: block;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.layout-menu-list button:hover {
+  background: #3a3a3a;
+}
+
+.layout {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #000;
+  overflow: hidden;
+}
+
 .slot {
+  position: absolute;
+  box-sizing: border-box;
   min-width: 0;
   min-height: 0;
+  z-index: 1;
+}
+
+/* Panes that fall out of the tree (e.g. when phase-4 preset switching has
+ * more current panes than the new preset can hold) stay mounted so their
+ * PTYs survive (spec §5 "レイアウト切替時にペインの内容は保持") but are
+ * tucked off-screen and made non-interactive. */
+.slot.detached {
+  left: -10000px;
+  top: -10000px;
+  width: 1px;
+  height: 1px;
+  visibility: hidden;
+  pointer-events: none;
 }

@@ -1,0 +1,54 @@
+/* Drag-resize handles between adjacent siblings of a split node.
+ *
+ * Two-layer design: an 8px transparent surface for hit testing (so the user
+ * doesn't have to pixel-hunt a 1-2px gutter) with a 2px coloured stripe
+ * centered inside it. Cursor and dimensions are direction-keyed so the same
+ * component renders both vertical and horizontal handles. */
+
+.splitter {
+  position: absolute;
+  z-index: 5; /* below pane-menu-backdrop (10), above slots (1) */
+  background: transparent;
+  touch-action: none;
+}
+
+.splitter::before {
+  content: "";
+  position: absolute;
+  background: #2a2a2a;
+  transition: background-color 80ms ease;
+}
+
+/* Vertical handle between left/right siblings of a `row` split. */
+.splitter[data-direction="row"] {
+  width: 8px;
+  margin-left: -4px; /* center the 8px hit area on the boundary x */
+  cursor: col-resize;
+}
+.splitter[data-direction="row"]::before {
+  left: 3px;
+  width: 2px;
+  top: 0;
+  bottom: 0;
+}
+
+/* Horizontal handle between top/bottom siblings of a `column` split. */
+.splitter[data-direction="column"] {
+  height: 8px;
+  margin-top: -4px;
+  cursor: row-resize;
+}
+.splitter[data-direction="column"]::before {
+  top: 3px;
+  height: 2px;
+  left: 0;
+  right: 0;
+}
+
+.splitter:hover::before {
+  background: #404040;
+}
+
+.splitter.dragging::before {
+  background: #4c8df6;
+}

@@ -205,3 +205,113 @@
   text-align: center;
   z-index: 1;
 }
+
+.pane-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pane-settings {
+  width: 360px;
+  max-width: 90vw;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  padding: 14px 16px;
+  font:
+    12px/1.35 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: #d4d4d4;
+}
+
+.pane-settings h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.pane-settings label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.pane-settings label span {
+  display: block;
+  margin-bottom: 3px;
+  color: #94a3b8;
+}
+
+.pane-settings input,
+.pane-settings textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #f6f6f6;
+  font: inherit;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  padding: 4px 6px;
+  resize: vertical;
+}
+
+.pane-settings input:focus,
+.pane-settings textarea:focus {
+  outline: 1px solid #4c8df6;
+  outline-offset: -1px;
+}
+
+.pane-settings-hint {
+  margin: 6px 0 8px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.pane-settings hr {
+  border: 0;
+  border-top: 1px solid #1a1a1a;
+  margin: 10px 0;
+}
+
+.pane-settings-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pane-settings-actions button {
+  appearance: none;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #d4d4d4;
+  font: inherit;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.pane-settings-actions button:hover:not(:disabled) {
+  background: #3a3a3a;
+}
+
+.pane-settings-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pane-settings-actions button.danger {
+  border-color: #803030;
+  color: #f87171;
+}
+
+.pane-settings-actions button.danger:hover:not(:disabled) {
+  background: #3a1414;
+}

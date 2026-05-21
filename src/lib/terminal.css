@@ -8,3 +8,25 @@
   height: 100%;
   padding: 4px;
 }
+
+/* Override the macOS "Always show scrollbars" system default for the xterm
+ * viewport. That default reserves a ~15px gutter with a bright track which
+ * looks intrusive against the dark terminal. The overlay style here keeps
+ * scrollback position visible without consuming column width. */
+.terminal-container .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.terminal-container .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(160, 160, 160, 0.25);
+  border-radius: 4px;
+}
+
+.terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(160, 160, 160, 0.5);
+}
