@@ -1,6 +1,6 @@
 .palette-search {
   padding: 12px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--relay-toolbar-border);
 }
 .palette-search input {
   width: 100%;
@@ -27,23 +27,23 @@
   align-items: baseline;
 }
 .palette-row.active {
-  background: rgba(99, 142, 255, 0.18);
+  background: var(--relay-palette-highlight);
 }
 .row-group {
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--relay-status-exited);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .row-label {
-  color: #f5f5f5;
+  color: var(--relay-modal-fg);
 }
 .row-hint {
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--relay-status-exited);
   font-size: 12px;
 }
 .palette-empty {
   padding: 12px 14px;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--relay-status-exited);
   font-style: italic;
 }

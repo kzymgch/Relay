@@ -58,18 +58,39 @@ impl Default for FontConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ThemeConfig {
-    /// `"dark"` or `"light"`. Stored verbatim; rendering wiring lands later.
-    pub mode: String,
+    /// Built-in theme id (`"dark"`, `"light"`, `"solarized-dark"`,
+    /// `"solarized-light"`, `"dracula"`) or `"custom"`. Empty / unknown
+    /// strings are migrated to `"dark"` at load time so older configs from
+    /// before this field existed continue to work.
     pub preset: String,
+    /// When `true`, the frontend asks the backend to enable macOS window
+    /// vibrancy on top of the chrome palette.
+    pub transparent: bool,
+    /// Palette overrides used when `preset == "custom"`. Required in that
+    /// case; ignored otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<CustomThemeConfig>,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            mode: "dark".into(),
-            preset: "default".into(),
+            preset: "dark".into(),
+            transparent: false,
+            custom: None,
         }
     }
+}
+
+/// Hex colour overrides for the custom preset. Keys are slot names
+/// (`background`, `appBg`, …); values must match `#rrggbb` or `#rrggbbaa`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CustomThemeConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub xterm: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chrome: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,6 +98,9 @@ impl Default for ThemeConfig {
 pub struct SendConfig {
     pub bracketed_paste: bool,
     pub trailing_newline: bool,
+    /// When `true`, the UI routes every send (drag-drop, Cmd+Shift+N,
+    /// palette) through the SendPreviewModal before writing to the PTY.
+    pub preview_before_send: bool,
 }
 
 impl Default for SendConfig {
@@ -84,6 +108,7 @@ impl Default for SendConfig {
         Self {
             bracketed_paste: true,
             trailing_newline: false,
+            preview_before_send: true,
         }
     }
 }
@@ -246,18 +271,42 @@ pub enum ConfigError {
 // Load / save / validate
 // ---------------------------------------------------------------------------
 
+/// Built-in theme ids accepted by `theme.preset`. Kept in sync with
+/// `src/lib/theme/presets.ts`. The list is short enough that a literal
+/// array beats a HashSet for readability and avoids a static lazy init.
+pub const BUILTIN_THEME_IDS: &[&str] = &[
+    "dark",
+    "light",
+    "solarized-dark",
+    "solarized-light",
+    "dracula",
+];
+
 /// Read a TOML config from `path`, falling back to defaults when the file
 /// doesn't exist. Other errors (corrupt TOML, validation failure) propagate
 /// so callers can show the user what went wrong.
 pub fn load_or_default(path: &Path) -> Result<RelayConfig, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let cfg: RelayConfig = toml::from_str(&text)?;
+            let mut cfg: RelayConfig = toml::from_str(&text)?;
+            migrate(&mut cfg);
             validate(&cfg)?;
             Ok(cfg)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RelayConfig::default()),
         Err(err) => Err(ConfigError::Io(err)),
+    }
+}
+
+/// In-place migration for old configs. Currently maps deprecated theme
+/// preset values (`"default"`, `""`, anything not in `BUILTIN_THEME_IDS` and
+/// not `"custom"`) onto `"dark"` so a config written before the theme system
+/// existed still validates cleanly.
+fn migrate(cfg: &mut RelayConfig) {
+    let preset = cfg.theme.preset.trim();
+    let is_known = preset == "custom" || BUILTIN_THEME_IDS.contains(&preset);
+    if !is_known {
+        cfg.theme.preset = "dark".into();
     }
 }
 
@@ -289,12 +338,25 @@ pub fn validate(cfg: &RelayConfig) -> Result<(), ConfigError> {
             cfg.scrollback.lines
         )));
     }
-    match cfg.theme.mode.as_str() {
-        "dark" | "light" => {}
-        other => {
-            return Err(ConfigError::Validation(format!(
-                "theme.mode must be \"dark\" or \"light\", got {other:?}"
-            )))
+    let preset = cfg.theme.preset.as_str();
+    let is_builtin = BUILTIN_THEME_IDS.contains(&preset);
+    if !is_builtin && preset != "custom" {
+        return Err(ConfigError::Validation(format!(
+            "theme.preset must be a built-in id or \"custom\", got {preset:?}"
+        )));
+    }
+    if preset == "custom" {
+        let Some(custom) = cfg.theme.custom.as_ref() else {
+            return Err(ConfigError::Validation(
+                "theme.custom must be set when theme.preset == \"custom\"".into(),
+            ));
+        };
+        for (slot, value) in custom.xterm.iter().chain(custom.chrome.iter()) {
+            if !is_valid_colour(value) {
+                return Err(ConfigError::Validation(format!(
+                    "theme.custom value for {slot:?} is not a valid colour: {value:?}"
+                )));
+            }
         }
     }
     for (idx, p) in cfg.pane.preset.iter().enumerate() {
@@ -334,6 +396,21 @@ pub fn validate(cfg: &RelayConfig) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Accept `#rrggbb`, `#rrggbbaa`, or an `rgb()/rgba()` form. xterm.js and our
+/// CSS variables both accept any of those, so we don't lock the user to one.
+fn is_valid_colour(value: &str) -> bool {
+    let v = value.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let ok_len = matches!(hex.len(), 3 | 4 | 6 | 8);
+        return ok_len && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    // Cheap rgba()/rgb() shape check — full grammar isn't worth the bytes.
+    if v.starts_with("rgb(") || v.starts_with("rgba(") {
+        return v.ends_with(')') && v.contains(',');
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +721,72 @@ mod tests {
         let mut cfg = RelayConfig::default();
         cfg.logging.secrets = vec!["(unterminated".into()];
         assert!(matches!(validate(&cfg), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn unknown_theme_preset_rejected() {
+        let mut cfg = RelayConfig::default();
+        cfg.theme.preset = "octopus".into();
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn custom_theme_requires_payload() {
+        let mut cfg = RelayConfig::default();
+        cfg.theme.preset = "custom".into();
+        cfg.theme.custom = None;
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn custom_theme_rejects_bad_colour() {
+        let mut cfg = RelayConfig::default();
+        cfg.theme.preset = "custom".into();
+        let mut payload = CustomThemeConfig::default();
+        payload
+            .xterm
+            .insert("background".into(), "not-a-colour".into());
+        cfg.theme.custom = Some(payload);
+        let err = validate(&cfg).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn custom_theme_accepts_valid_colours() {
+        let mut cfg = RelayConfig::default();
+        cfg.theme.preset = "custom".into();
+        let mut payload = CustomThemeConfig::default();
+        payload.xterm.insert("background".into(), "#112233".into());
+        payload
+            .chrome
+            .insert("appBg".into(), "rgba(0, 0, 0, 0.5)".into());
+        cfg.theme.custom = Some(payload);
+        validate(&cfg).expect("custom theme with valid colours validates");
+    }
+
+    #[test]
+    fn custom_theme_with_empty_payload_validates() {
+        // The settings UI submits `theme.custom = Some({ xterm: {}, chrome: {} })`
+        // when the user picks the Custom preset but doesn't touch any
+        // colour picker. The resolver falls back to FALLBACK_THEME for
+        // every slot; validation must accept this shape.
+        let mut cfg = RelayConfig::default();
+        cfg.theme.preset = "custom".into();
+        cfg.theme.custom = Some(CustomThemeConfig::default());
+        validate(&cfg).expect("custom theme with empty payload validates");
+    }
+
+    #[test]
+    fn old_theme_mode_field_migrates_to_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Mimic a pre-PR config file: `mode` + a vague `preset = "default"`.
+        std::fs::write(&path, "[theme]\nmode = \"dark\"\npreset = \"default\"\n").unwrap();
+        let cfg = load_or_default(&path).expect("load");
+        assert_eq!(cfg.theme.preset, "dark");
+        assert!(!cfg.theme.transparent);
     }
 
     #[test]

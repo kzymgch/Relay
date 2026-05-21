@@ -6,6 +6,7 @@ pub mod pipe;
 pub mod pty;
 pub mod session;
 pub mod ssh;
+pub mod window_effects;
 
 use std::sync::Arc;
 
@@ -124,6 +125,7 @@ pub fn run() {
             bridge::ssh_keychain_set,
             bridge::ssh_keychain_has,
             bridge::ssh_keychain_delete,
+            window_effects::set_window_vibrancy,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

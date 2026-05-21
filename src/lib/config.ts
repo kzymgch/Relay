@@ -16,15 +16,27 @@ export interface FontConfig {
   size: number;
 }
 
+export interface CustomThemePayload {
+  /** xterm palette overrides keyed by slot name (e.g. `background`, `red`). */
+  xterm: Record<string, string>;
+  /** Chrome palette overrides keyed by slot name (e.g. `appBg`). */
+  chrome: Record<string, string>;
+}
+
 export interface ThemeConfig {
-  /** `"dark"` or `"light"` — stored verbatim now, applied in a later phase. */
-  mode: string;
+  /** Built-in theme id (`dark`, `light`, `solarized-dark`, …) or `"custom"`. */
   preset: string;
+  /** When true, applies macOS window vibrancy on top of the chrome palette. */
+  transparent: boolean;
+  /** Required when `preset === "custom"`. */
+  custom?: CustomThemePayload | null;
 }
 
 export interface SendConfig {
   bracketedPaste: boolean;
   trailingNewline: boolean;
+  /** Show a preview modal before every send (drag-drop, Cmd+Shift+N, palette). */
+  previewBeforeSend: boolean;
 }
 
 export interface ScrollbackConfig {
@@ -85,8 +97,8 @@ export interface RelayConfig {
 export function defaultConfig(): RelayConfig {
   return {
     font: { family: "Menlo", size: 13 },
-    theme: { mode: "dark", preset: "default" },
-    send: { bracketedPaste: true, trailingNewline: false },
+    theme: { preset: "dark", transparent: false, custom: null },
+    send: { bracketedPaste: true, trailingNewline: false, previewBeforeSend: true },
     scrollback: { lines: 10_000, persistOnExit: false, persistMaxBytes: 1024 * 1024 },
     session: { autosaveOnExit: true, restoreOnLaunch: true },
     logging: defaultLoggingConfig(),

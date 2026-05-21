@@ -788,8 +788,16 @@ fn reaches(graph: &HashMap<&str, Vec<&str>>, from: &str, to: &str) -> bool {
 
 /// Spawn the global ticker that flushes due `TailPeriodic` rules. Returns a
 /// handle the caller can keep alive (dropping it cancels the task).
-pub fn spawn_ticker(registry: Arc<PipeRegistry>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+///
+/// Uses `tauri::async_runtime::spawn` rather than raw `tokio::spawn` because
+/// the only caller (the Tauri `setup` hook) executes inside macOS's
+/// `applicationDidFinishLaunching:` delegate — with `macOSPrivateApi` +
+/// `transparent: true` the runtime isn't entered there yet, so `tokio::spawn`
+/// would panic with "no reactor running". `async_runtime::spawn` always
+/// hands the task to Tauri's owned runtime regardless of the current
+/// thread context.
+pub fn spawn_ticker(registry: Arc<PipeRegistry>) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(PERIODIC_TICK);
         // First tick fires immediately by default — skip it so brand-new
         // rules don't see a flush before any input has been observed.

@@ -9,6 +9,7 @@
   import "./terminal.css";
 
   import type { TerminalApi, TerminalProps } from "./terminal";
+  import SelectionChip from "./send/SelectionChip.svelte";
 
   let {
     theme,
@@ -16,6 +17,8 @@
     fontSize = 13,
     scrollback = 10000,
     cursorBlink = true,
+    paneId,
+    sourceLabel,
     ondata,
     onresize,
     onready,
@@ -131,4 +134,8 @@
   });
 </script>
 
-<div bind:this={containerEl} class="terminal-container"></div>
+<div bind:this={containerEl} class="terminal-container">
+  {#if term && containerEl && paneId}
+    <SelectionChip {term} container={containerEl} {paneId} sourceLabel={sourceLabel ?? paneId} />
+  {/if}
+</div>

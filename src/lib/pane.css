@@ -3,14 +3,20 @@
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: #1e1e1e;
+  background: var(--relay-pane-bg);
   border: 2px solid transparent;
   box-sizing: border-box;
   overflow: hidden;
 }
 
 .pane.focused {
-  border-color: #4c8df6;
+  border-color: var(--relay-pane-border-focused);
+}
+
+.pane.drop-active {
+  outline: 2px dashed var(--relay-pane-border-focused);
+  outline-offset: -4px;
+  background: var(--relay-drop-highlight);
 }
 
 .pane-header {
@@ -23,9 +29,9 @@
     system-ui,
     -apple-system,
     sans-serif;
-  color: #d4d4d4;
-  background: #2a2a2a;
-  border-bottom: 1px solid #1a1a1a;
+  color: var(--relay-pane-header-fg);
+  background: var(--relay-pane-header-bg);
+  border-bottom: 1px solid var(--relay-toolbar-bg);
   user-select: none;
 }
 
@@ -37,35 +43,35 @@
 .pane-header .status {
   flex: 1;
   font-size: 11px;
-  color: #9ca3af;
+  color: var(--relay-status-exited);
 }
 
 .pane-header .status-running {
-  color: #4ade80;
+  color: var(--relay-status-running);
 }
 
 .pane-header .status-spawning {
-  color: #fbbf24;
+  color: var(--relay-status-spawning);
 }
 
 .pane-header .status-exited {
-  color: #94a3b8;
+  color: var(--relay-status-exited);
 }
 
 .pane-header .status-error {
-  color: #f87171;
+  color: var(--relay-status-error);
 }
 
 .pane-header .status-connecting {
-  color: #fbbf24;
+  color: var(--relay-status-spawning);
 }
 
 .pane-header .status-reconnecting {
-  color: #fb923c;
+  color: var(--relay-status-spawning);
 }
 
 .pane-header .status-disconnected {
-  color: #f87171;
+  color: var(--relay-status-error);
 }
 
 .pane-header .actions {
@@ -76,8 +82,8 @@
 .pane-header .actions button {
   appearance: none;
   background: transparent;
-  color: #d4d4d4;
-  border: 1px solid #444;
+  color: var(--relay-pane-header-fg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
   padding: 1px 6px;
   font: inherit;
@@ -85,7 +91,7 @@
 }
 
 .pane-header .actions button:hover:not(:disabled) {
-  background: #3a3a3a;
+  background: var(--relay-palette-highlight);
 }
 
 .pane-header .actions button:disabled {
@@ -112,8 +118,8 @@
   margin: 0;
   padding: 4px 0;
   list-style: none;
-  background: #2a2a2a;
-  border: 1px solid #444;
+  background: var(--relay-pane-header-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 6px;
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
   font:
@@ -121,7 +127,7 @@
     system-ui,
     -apple-system,
     sans-serif;
-  color: #d4d4d4;
+  color: var(--relay-pane-header-fg);
 }
 
 .pane-menu-header {
@@ -129,8 +135,8 @@
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #94a3b8;
-  border-bottom: 1px solid #1a1a1a;
+  color: var(--relay-status-exited);
+  border-bottom: 1px solid var(--relay-toolbar-bg);
   margin-bottom: 4px;
 }
 
@@ -148,7 +154,7 @@
 }
 
 .pane-menu button:hover {
-  background: #3a3a3a;
+  background: var(--relay-palette-highlight);
 }
 
 .pane-search {
@@ -160,8 +166,8 @@
   align-items: center;
   gap: 4px;
   padding: 4px 6px;
-  background: #2a2a2a;
-  border: 1px solid #444;
+  background: var(--relay-pane-header-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 6px;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
   font:
@@ -173,24 +179,24 @@
 
 .pane-search input {
   width: 180px;
-  background: #1e1e1e;
-  border: 1px solid #444;
+  background: var(--relay-pane-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
-  color: #f6f6f6;
+  color: var(--relay-modal-fg);
   font: inherit;
   padding: 2px 6px;
 }
 
 .pane-search input:focus {
-  outline: 1px solid #4c8df6;
+  outline: 1px solid var(--relay-pane-border-focused);
   outline-offset: -1px;
 }
 
 .pane-search button {
   appearance: none;
   background: transparent;
-  color: #d4d4d4;
-  border: 1px solid #444;
+  color: var(--relay-pane-header-fg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
   padding: 1px 6px;
   font: inherit;
@@ -198,7 +204,7 @@
 }
 
 .pane-search button:hover {
-  background: #3a3a3a;
+  background: var(--relay-palette-highlight);
 }
 
 .pane-error {
@@ -208,7 +214,7 @@
   align-items: center;
   justify-content: center;
   background: rgba(248, 113, 113, 0.12);
-  color: #fca5a5;
+  color: var(--relay-status-error);
   font:
     13px/1.4 ui-sans-serif,
     system-ui,
@@ -222,7 +228,7 @@
   position: fixed;
   inset: 0;
   z-index: 10;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--relay-modal-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -231,8 +237,8 @@
 .pane-settings {
   width: 360px;
   max-width: 90vw;
-  background: #2a2a2a;
-  border: 1px solid #444;
+  background: var(--relay-modal-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 8px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
   padding: 14px 16px;
@@ -241,7 +247,7 @@
     system-ui,
     -apple-system,
     sans-serif;
-  color: #d4d4d4;
+  color: var(--relay-modal-fg);
 }
 
 .pane-settings h3 {
@@ -258,17 +264,17 @@
 .pane-settings label span {
   display: block;
   margin-bottom: 3px;
-  color: #94a3b8;
+  color: var(--relay-status-exited);
 }
 
 .pane-settings input,
 .pane-settings textarea {
   width: 100%;
   box-sizing: border-box;
-  background: #1e1e1e;
-  border: 1px solid #444;
+  background: var(--relay-pane-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
-  color: #f6f6f6;
+  color: var(--relay-modal-fg);
   font: inherit;
   font-family: "SFMono-Regular", Consolas, monospace;
   padding: 4px 6px;
@@ -277,19 +283,19 @@
 
 .pane-settings input:focus,
 .pane-settings textarea:focus {
-  outline: 1px solid #4c8df6;
+  outline: 1px solid var(--relay-pane-border-focused);
   outline-offset: -1px;
 }
 
 .pane-settings-hint {
   margin: 6px 0 8px;
-  color: #94a3b8;
+  color: var(--relay-status-exited);
   font-size: 11px;
 }
 
 .pane-settings hr {
   border: 0;
-  border-top: 1px solid #1a1a1a;
+  border-top: 1px solid var(--relay-toolbar-bg);
   margin: 10px 0;
 }
 
@@ -301,17 +307,17 @@
 
 .pane-settings-actions button {
   appearance: none;
-  background: #1e1e1e;
-  border: 1px solid #444;
+  background: var(--relay-pane-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
-  color: #d4d4d4;
+  color: var(--relay-pane-header-fg);
   font: inherit;
   padding: 3px 10px;
   cursor: pointer;
 }
 
 .pane-settings-actions button:hover:not(:disabled) {
-  background: #3a3a3a;
+  background: var(--relay-palette-highlight);
 }
 
 .pane-settings-actions button:disabled {
@@ -320,10 +326,10 @@
 }
 
 .pane-settings-actions button.danger {
-  border-color: #803030;
-  color: #f87171;
+  border-color: var(--relay-status-error);
+  color: var(--relay-status-error);
 }
 
 .pane-settings-actions button.danger:hover:not(:disabled) {
-  background: #3a1414;
+  background: rgba(248, 113, 113, 0.15);
 }

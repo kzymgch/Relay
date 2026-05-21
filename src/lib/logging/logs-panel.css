@@ -3,11 +3,11 @@
   justify-content: space-between;
   align-items: center;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--relay-toolbar-border);
 }
 
 .logs-panel-meta {
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--relay-status-exited);
   font-size: 12px;
   padding: 6px 12px;
 }
@@ -21,8 +21,8 @@
   padding: 8px 10px;
   font-family: Menlo, Monaco, "Courier New", monospace;
   font-size: 12px;
-  background: rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--relay-app-bg);
+  border: 1px solid var(--relay-toolbar-border);
   border-radius: 4px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -31,6 +31,6 @@
 }
 
 .logs-panel-empty {
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--relay-status-exited);
   font-style: italic;
 }

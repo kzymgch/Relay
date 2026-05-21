@@ -8,8 +8,13 @@
   import Splitter from "./layout/Splitter.svelte";
   import type { PaneId, PaneSpec, SplitterInfo } from "./layout/tree";
   import { createConfigStore } from "./config.svelte";
-  import { onConfigChanged, type RelayConfig, type ThemeConfig } from "./config";
-  import type { ITheme } from "@xterm/xterm";
+  import { onConfigChanged, type RelayConfig } from "./config";
+  import { resolveTheme } from "./theme/resolve";
+  import { applyChromePalette } from "./theme/chrome";
+  import { resolveKeybinds } from "./keybind/resolve";
+  import { dispatchKey, shouldHandleInEditable } from "./keybind/dispatch";
+  import SendPreviewModal from "./send/SendPreviewModal.svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     applySessionRules,
     clearAutosaveScrollback,
@@ -80,20 +85,6 @@
     return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, n));
   }
 
-  /**
-   * Map a `KeyboardEvent.code` like "Digit3" to `3`, returning `undefined`
-   * for anything else. We use `code` rather than `key` for digit shortcuts
-   * because `event.key` is layout- and Shift-dependent: on a US keyboard
-   * Cmd+Shift+2 surfaces as `"@"`, not `"2"`, so a `parseInt(event.key, 10)`
-   * gate would silently swallow the user's send-to-pane-2 keystroke.
-   * `event.code` describes the physical key and is stable across layouts
-   * and modifiers.
-   */
-  function digitFromCode(code: string): number | undefined {
-    const m = /^Digit([1-9])$/.exec(code);
-    return m ? Number.parseInt(m[1]!, 10) : undefined;
-  }
-
   // Pane handles registered via `onregister`, keyed by pane id (not by PTY
   // id — the pane id is durable across restarts, the PTY id changes).
   // Plain object rather than $state because we read them at the moment of
@@ -109,6 +100,19 @@
 
   let sendOptions: SendOptions = $state({ ...DEFAULT_SEND_OPTIONS });
   const history = new SendHistory();
+
+  /**
+   * Pending send awaiting user confirmation. Populated by drag-drop, Cmd+Shift
+   * keybindings, and palette send actions when `config.send.previewBeforeSend`
+   * is on. `null` means no modal is shown.
+   */
+  let previewRequest: {
+    sourcePaneId: PaneId;
+    targetPaneId: PaneId;
+    sourceLabel: string;
+    targetLabel: string;
+    text: string;
+  } | null = $state(null);
 
   // Pipe rules mirror the Rust registry. Refreshed on panel open, after
   // every CRUD, and on session load. Drives the status-bar count and the
@@ -148,36 +152,37 @@
     }
   }
 
-  /**
-   * Translate the user-facing `config.theme.mode` (`"dark"` | `"light"`) into
-   * an xterm `ITheme`. Kept minimal on purpose — full preset / custom palette
-   * support is intentionally out of scope here; this is only the wiring that
-   * makes the existing toggle actually take effect.
-   */
-  function themeFromConfig(theme: ThemeConfig): ITheme {
-    if (theme.mode === "light") {
-      return {
-        background: "#ffffff",
-        foreground: "#1a1a1a",
-        cursor: "#1a1a1a",
-        selectionBackground: "rgba(0, 0, 0, 0.15)",
-      };
-    }
-    return {
-      background: "#1f2125",
-      foreground: "#f5f5f5",
-      cursor: "#f5f5f5",
-      selectionBackground: "rgba(255, 255, 255, 0.2)",
-    };
-  }
-
-  // Derived xterm options. Re-computed on every config change because the
-  // hot-reload listener writes `config.current` and we want the Terminal
-  // component to pick up the new theme / family / scrollback without a
-  // restart.
-  const terminalTheme = $derived(themeFromConfig(config.current.theme));
+  // Derived xterm + chrome options. Re-computed on every config change so the
+  // hot-reload listener and the in-app settings form both propagate without a
+  // restart. `applyChromePalette` is fired in a `$effect` below.
+  const resolved = $derived(resolveTheme(config.current.theme));
+  const terminalTheme = $derived(resolved.xterm);
   const fontFamily = $derived(config.current.font.family);
   const scrollback = $derived(config.current.scrollback.lines);
+  // Resolved keybind map, recomputed whenever `config.keybind` changes.
+  // Built once per config snapshot rather than per keystroke so handleKeydown
+  // is a tight Map.get + matches() call on the hot path.
+  const resolvedKeybinds = $derived(resolveKeybinds(config.current.keybind));
+
+  // Apply chrome (CSS variables on :root) reactively. Browsers diff custom-
+  // property writes, so re-setting an identical palette is a no-op.
+  $effect(() => {
+    if (typeof document === "undefined") return;
+    applyChromePalette(resolved.chrome);
+  });
+
+  // Push the transparency flag to the Rust window-effects command. The async
+  // call is fire-and-forget; failures (e.g. non-macOS, missing private API)
+  // log without surfacing to the user, who only loses the visual effect.
+  let lastVibrancy: boolean | undefined;
+  $effect(() => {
+    const enabled = config.current.theme.transparent;
+    if (lastVibrancy === enabled) return;
+    lastVibrancy = enabled;
+    void invoke("set_window_vibrancy", { enabled }).catch((e) => {
+      console.warn("[app] set_window_vibrancy failed", e);
+    });
+  });
 
   /**
    * Persist a font-size change back to config so the next launch (and any
@@ -526,6 +531,10 @@
    * Read the selection from `source`, then deliver it to `target`'s PTY via
    * the Rust bridge. No-ops cleanly when either side isn't ready yet (still
    * spawning, exited, or selection is empty).
+   *
+   * When `config.send.previewBeforeSend` is on, this opens the preview modal
+   * and resolves after the user confirms / cancels. Otherwise it writes
+   * directly to the target PTY using the current `sendOptions` defaults.
    */
   async function sendSelection(source: PaneId, target: PaneId): Promise<void> {
     if (source === target) return;
@@ -534,26 +543,91 @@
     if (!src || !tgt) return;
     const text = src.getSelection();
     if (!text) return;
+    await routeSend({
+      sourcePaneId: source,
+      targetPaneId: target,
+      sourceLabel: src.label,
+      targetLabel: tgt.label,
+      text,
+    });
+  }
+
+  /**
+   * Drop handler — selection text arrives via DnD with the source pane id
+   * already stamped on the DataTransfer. We resolve labels via the live
+   * handle registry so the modal renders the up-to-date pane names.
+   */
+  function handleSendDropped(sourcePaneId: PaneId, targetPaneId: PaneId, text: string): void {
+    if (sourcePaneId === targetPaneId) return;
+    const src = handles[sourcePaneId];
+    const tgt = handles[targetPaneId];
+    if (!tgt) return;
+    void routeSend({
+      sourcePaneId,
+      targetPaneId,
+      sourceLabel: src?.label ?? sourcePaneId,
+      targetLabel: tgt.label,
+      text,
+    });
+  }
+
+  async function routeSend(req: {
+    sourcePaneId: PaneId;
+    targetPaneId: PaneId;
+    sourceLabel: string;
+    targetLabel: string;
+    text: string;
+  }): Promise<void> {
+    if (config.current.send.previewBeforeSend) {
+      previewRequest = req;
+      return;
+    }
+    await deliverSend(req, sendOptions);
+  }
+
+  async function deliverSend(
+    req: {
+      sourcePaneId: PaneId;
+      targetPaneId: PaneId;
+      sourceLabel: string;
+      targetLabel: string;
+      text: string;
+    },
+    options: SendOptions
+  ): Promise<void> {
+    const tgt = handles[req.targetPaneId];
+    if (!tgt) return;
     const targetPtyId = tgt.getPtyId();
     if (!targetPtyId) return;
     try {
       await sendTextTo(
         {
-          text,
+          text: req.text,
           targetPtyId,
-          sourceLabel: src.label,
-          targetLabel: tgt.label,
-          options: sendOptions,
+          sourceLabel: req.sourceLabel,
+          targetLabel: req.targetLabel,
+          options,
         },
         history,
         sendOptions
       );
       // Status bar surfaces "focused → target"; remember the target per
       // source so a follow-up focus jump still shows the prior pick.
-      store.recordSend(source, target);
+      store.recordSend(req.sourcePaneId, req.targetPaneId);
     } catch (e) {
       console.error("[page] pty_send_text failed", e);
     }
+  }
+
+  function confirmPreview(options: SendOptions): void {
+    const req = previewRequest;
+    previewRequest = null;
+    if (!req) return;
+    void deliverSend(req, options);
+  }
+
+  function cancelPreview(): void {
+    previewRequest = null;
   }
 
   /**
@@ -596,82 +670,104 @@
     }
   }
 
-  function handleKeydown(event: KeyboardEvent) {
-    // All shortcuts in this app are Cmd-based; bail early on anything else
-    // so unrelated typing (including ctrl-based zsh bindings inside the
-    // terminal) is never preempted.
-    if (!event.metaKey) return;
-    if (event.ctrlKey || event.altKey) return;
+  function focusPaneByIndex(idx1: number): boolean {
+    const order = store.paneOrder;
+    // Cmd+9 follows the tmux / iTerm convention: jump to the *last* pane,
+    // however many there are. Cmd+1..8 index normally into the visual
+    // top-left DFS order.
+    const idx = idx1 === 9 ? order.length - 1 : idx1 - 1;
+    const target = order[idx];
+    if (target === undefined) return false;
+    store.focus(target);
+    return true;
+  }
 
-    switch (event.code) {
-      case "Equal":
-        event.preventDefault();
-        fontSize = clampFontSize(fontSize + FONT_STEP);
-        persistFontSize(fontSize);
-        return;
-      case "Minus":
-        event.preventDefault();
-        fontSize = clampFontSize(fontSize - FONT_STEP);
-        persistFontSize(fontSize);
-        return;
-      case "Digit0":
-        event.preventDefault();
-        fontSize = DEFAULT_FONT_SIZE;
-        persistFontSize(fontSize);
-        return;
-    }
+  function sendSelectionByIndex(idx1: number): boolean {
+    const order = store.paneOrder;
+    const idx = idx1 === 9 ? order.length - 1 : idx1 - 1;
+    const target = order[idx];
+    if (target === undefined) return false;
+    void sendSelection(store.focusedPaneId, target);
+    return true;
+  }
 
-    const digit = digitFromCode(event.code);
-    if (digit !== undefined) {
-      const order = store.paneOrder;
-      // Cmd+9 follows the tmux / iTerm convention: jump to the *last* pane,
-      // however many there are. Cmd+1..8 index normally into the visual
-      // top-left DFS order.
-      const idx = digit === 9 ? order.length - 1 : digit - 1;
-      const target = order[idx];
-      if (target !== undefined) {
-        event.preventDefault();
-        if (event.shiftKey) {
-          void sendSelection(store.focusedPaneId, target);
-        } else {
-          store.focus(target);
-        }
-        return;
-      }
-    }
-    if (event.shiftKey) return;
+  function bumpFontBy(delta: number): void {
+    fontSize = clampFontSize(fontSize + delta);
+    persistFontSize(fontSize);
+  }
 
-    // Modal hotkeys are routed by `event.code` (physical key) for the same
-    // layout-stability reason as Cmd+1..N. Cmd+P / Cmd+, are spec §13.
-    switch (event.code) {
-      case "KeyP":
-        event.preventDefault();
+  function resetFont(): void {
+    fontSize = DEFAULT_FONT_SIZE;
+    persistFontSize(fontSize);
+  }
+
+  /**
+   * Action.id → handler. Returns `false` when the action declined to fire
+   * (e.g. focus pane 7 when only 3 panes exist), so the dispatcher can let
+   * the keystroke fall through to the terminal. Returns `true` to
+   * preventDefault and stop.
+   */
+  function handlersFor(): Record<string, () => boolean> {
+    const focused = handles[store.focusedPaneId];
+    const handlers: Record<string, () => boolean> = {
+      "view.font.larger": () => {
+        bumpFontBy(+FONT_STEP);
+        return true;
+      },
+      "view.font.smaller": () => {
+        bumpFontBy(-FONT_STEP);
+        return true;
+      },
+      "view.font.reset": () => {
+        resetFont();
+        return true;
+      },
+      "palette.open": () => {
         void openPalette();
-        return;
-      case "Comma":
-        event.preventDefault();
+        return true;
+      },
+      "settings.open": () => {
         settingsSection = null;
         settingsOpen = true;
-        return;
-    }
-
-    const focused = handles[store.focusedPaneId];
-    switch (event.key) {
-      case "k":
-      case "K":
-        event.preventDefault();
+        return true;
+      },
+      "pane.clear": () => {
         focused?.clear();
-        return;
-      case "r":
-      case "R":
-        event.preventDefault();
+        return true;
+      },
+      "pane.restart": () => {
         focused?.restart();
-        return;
-      case "f":
-      case "F":
-        event.preventDefault();
+        return true;
+      },
+      "pane.search": () => {
         focused?.openSearch();
-        return;
+        return true;
+      },
+    };
+    for (let i = 1; i <= 9; i++) {
+      const n = i;
+      handlers[`pane.focus.${n}`] = () => focusPaneByIndex(n);
+      handlers[`send.to.${n}`] = () => sendSelectionByIndex(n);
+    }
+    return handlers;
+  }
+
+  function handleKeydown(event: KeyboardEvent) {
+    // No early modifier filter: the user can bind any key (Ctrl-based,
+    // bare F-keys, modifier-less digits). dispatchKey iterates the action
+    // registry once and bails when nothing matches.
+    //
+    // Skip when the event lands on an editable element (xterm's textarea,
+    // settings inputs, search box) and the combo would otherwise hijack a
+    // printable keystroke — `shouldHandleInEditable` encodes that rule.
+    if (!shouldHandleInEditable(event)) return;
+    const actionId = dispatchKey(event, resolvedKeybinds);
+    if (!actionId) return;
+    const handler = handlersFor()[actionId];
+    if (!handler) return;
+    const fired = handler();
+    if (fired) {
+      event.preventDefault();
     }
   }
 
@@ -842,6 +938,8 @@
           focused={store.focusedPaneId === pane.id}
           onfocus={() => store.focus(pane.id)}
           sendTargets={sendTargetsFor(pane.id)}
+          paneId={pane.id}
+          onsenddropped={(info) => handleSendDropped(info.sourcePaneId, pane.id, info.text)}
           onregister={(h) => registerHandle(pane.id, h)}
           onclose={canClose() ? () => store.closePane(pane.id) : undefined}
           onsplit={(direction, position) => {
@@ -909,5 +1007,14 @@
       logsPanelOpen = false;
       logsPanelPaneId = null;
     }}
+  />
+  <SendPreviewModal
+    open={previewRequest !== null}
+    sourceLabel={previewRequest?.sourceLabel ?? ""}
+    targetLabel={previewRequest?.targetLabel ?? ""}
+    text={previewRequest?.text ?? ""}
+    defaults={sendOptions}
+    onconfirm={confirmPreview}
+    oncancel={cancelPreview}
   />
 </div>

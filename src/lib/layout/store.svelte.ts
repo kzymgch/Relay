@@ -379,10 +379,11 @@ export function createLayoutStore(
     },
 
     saveCustomLayout(name) {
-      // structuredClone keeps the snapshot frozen against further mutations.
-      // (Modern node/jsdom both support it; if a future target doesn't, swap
-      // for a JSON round-trip.)
-      customLayouts.set(name, structuredClone({ tree, panes, focusedPaneId }));
+      // `$state.snapshot` unwraps Svelte 5's reactive proxy into a plain
+      // POJO. `structuredClone` here would throw `DataCloneError` because
+      // the proxy carries non-cloneable internals; the cloned snapshot
+      // freezes the layout against later mutations.
+      customLayouts.set(name, $state.snapshot({ tree, panes, focusedPaneId }));
     },
 
     applyCustomLayout(name) {
@@ -394,37 +395,41 @@ export function createLayoutStore(
       // get it back, until in-memory layouts are persisted in PR-15).
       const detach = dfsLeafOrder(tree).filter((id) => !snapLeafIds.has(id));
       // Union the panes records — snapshot's specs win for shared ids.
-      // structuredClone the inner record so mutations on either side stay
-      // isolated.
-      panes = { ...panes, ...structuredClone(snap.panes) };
-      tree = structuredClone(snap.tree);
+      // `$state.snapshot` on the inner record so mutations on either side
+      // stay isolated (and we don't trip structuredClone on the proxy).
+      panes = { ...panes, ...$state.snapshot(snap.panes) };
+      tree = $state.snapshot(snap.tree);
       if (detach.length > 0) detachedPanes.push(...detach);
       focusedPaneId = snap.focusedPaneId;
       ensureFocusedExists();
     },
 
     exportSnapshot() {
+      // `$state.snapshot` rather than `structuredClone` — the store's
+      // reactive proxy isn't structurally cloneable, and session save
+      // would throw `DataCloneError` the moment the user picked
+      // "Save session as…".
       const cl: Record<string, LayoutSnapshot> = {};
       for (const [key, snap] of customLayouts) {
-        cl[key] = structuredClone(snap);
+        cl[key] = $state.snapshot(snap);
       }
       return {
-        tree: structuredClone(tree),
-        panes: structuredClone(panes),
+        tree: $state.snapshot(tree),
+        panes: $state.snapshot(panes),
         focusedPaneId,
         customLayouts: cl,
       };
     },
 
     importSnapshot(snap) {
-      tree = structuredClone(snap.tree);
-      panes = structuredClone(snap.panes);
+      tree = $state.snapshot(snap.tree);
+      panes = $state.snapshot(snap.panes);
       focusedPaneId = snap.focusedPaneId;
       detachedPanes.splice(0, detachedPanes.length);
       customLayouts.clear();
       if (snap.customLayouts) {
         for (const [key, value] of Object.entries(snap.customLayouts)) {
-          customLayouts.set(key, structuredClone(value));
+          customLayouts.set(key, $state.snapshot(value));
         }
       }
       ensureFocusedExists();

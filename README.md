@@ -59,6 +59,7 @@ pnpm dev              # Vite dev server at http://localhost:1420
 | `pnpm typecheck`    | `svelte-kit sync` + `svelte-check`        |
 | `pnpm test`         | Vitest (run once)                         |
 | `pnpm test:watch`   | Vitest (watch mode)                       |
+| `pnpm e2e`          | Playwright browser smoke (chromium)       |
 
 Rust (run inside `src-tauri/`):
 
@@ -134,6 +135,11 @@ Every PR runs on `macos-14` (Apple Silicon) in GitHub Actions:
 
 - **Frontend**: `pnpm lint`, `pnpm typecheck`, `pnpm format:check`, `pnpm test`
 - **Rust**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`
+- **Browser smoke**: `pnpm e2e` (Playwright with `mockIPC` stubs for the Tauri layer)
+
+Before tagging a release, walk through [`scripts/manual-smoke.md`](./scripts/manual-smoke.md)
+on the produced `.app` bundle — that's where real PTYs, real filesystem
+persistence, and macOS window vibrancy get exercised.
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for branch naming, commit rules,
 and the per-PR Definition of Done.

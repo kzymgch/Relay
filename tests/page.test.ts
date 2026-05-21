@@ -57,6 +57,36 @@ let nextPaneId = 1;
 function installIpcMock(): void {
   mockIPC((cmd, args) => {
     invocations.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+    if (cmd === "config_load") {
+      // Tests in this file pre-date the preview-before-send flow and
+      // assert the direct `pty_send_text` path. Opt the loaded config
+      // out so Cmd+Shift+N keeps writing straight to the target PTY.
+      return {
+        font: { family: "Menlo", size: 13 },
+        theme: { preset: "dark", transparent: false, custom: null },
+        send: { bracketedPaste: true, trailingNewline: false, previewBeforeSend: false },
+        scrollback: { lines: 10000, persistOnExit: false, persistMaxBytes: 1024 * 1024 },
+        session: { autosaveOnExit: false, restoreOnLaunch: false },
+        logging: {
+          enabled: false,
+          dir: "",
+          mode: "plain",
+          maxBytes: 10485760,
+          maxFiles: 5,
+          dailyRotation: true,
+          secrets: [],
+        },
+        keybind: {},
+        defaultPane: {
+          label: "Pane",
+          command: "/bin/zsh",
+          args: ["-l"],
+          cwd: null,
+          env: {},
+        },
+        pane: { preset: [] },
+      };
+    }
     return undefined;
   });
 }
@@ -242,14 +272,14 @@ describe("Page — inter-pane send", () => {
     await mountPage();
     const [left] = getXtermState().instances;
     left!.clear.mockClear();
-    await fireEvent.keyDown(window, { key: "k", metaKey: true });
+    await fireEvent.keyDown(window, { key: "k", code: "KeyK", metaKey: true });
     expect(left!.clear).toHaveBeenCalledTimes(1);
   });
 
   it("Cmd+R restarts the focused pane (kill + respawn)", async () => {
     await mountPage();
     invocations = [];
-    await fireEvent.keyDown(window, { key: "r", metaKey: true });
+    await fireEvent.keyDown(window, { key: "r", code: "KeyR", metaKey: true });
     await vi.waitFor(() => {
       expect(invocations.find((i) => i.cmd === "pty_kill")).toBeDefined();
       expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeDefined();
@@ -264,7 +294,7 @@ describe("Page — inter-pane send", () => {
   it("Cmd+F opens the focused pane's search bar", async () => {
     const { container } = await mountPage();
     expect(container.querySelector('[data-testid="pane-search"]')).toBeNull();
-    await fireEvent.keyDown(window, { key: "f", metaKey: true });
+    await fireEvent.keyDown(window, { key: "f", code: "KeyF", metaKey: true });
     await vi.waitFor(() => {
       expect(container.querySelector('[data-testid="pane-search"]')).not.toBeNull();
     });
