@@ -1,0 +1,66 @@
+# --- Working notes / local docs (kept out of the repo by request) ---
+docs/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Node / pnpm ---
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Vite / Svelte ---
+dist/
+.svelte-kit/
+.vite/
+build/
+/package
+vite.config.*.timestamp-*
+
+# --- TypeScript ---
+*.tsbuildinfo
+
+# --- Rust / Cargo ---
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# --- Tauri ---
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+
+# --- Test / coverage ---
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# --- Editors / IDE ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Misc ---
+.cache/
+.tmp/
+.turbo/

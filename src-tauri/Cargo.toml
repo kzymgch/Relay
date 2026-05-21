@@ -1,0 +1,24 @@
+[package]
+name = "relay"
+version = "0.1.0"
+description = "Multi-pane terminal app for orchestrating CLIs side-by-side."
+authors = ["Relay contributors"]
+edition = "2021"
+rust-version = "1.80"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix is required to avoid Windows bin/lib name collisions.
+# See https://github.com/rust-lang/cargo/issues/8519
+name = "relay_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
