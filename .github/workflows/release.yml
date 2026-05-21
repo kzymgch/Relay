@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  # Tag-driven: a push of `vX.Y.Z` produces a draft GitHub Release with
+  # the matching artifacts.
+  push:
+    tags:
+      - "v*.*.*"
+  # Manual dry-run: pick a tag from the dropdown to build the same way
+  # without producing a final release. Useful for verifying the
+  # workflow itself before cutting a real tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Created as a draft Release."
+        required: true
+        default: "v0.0.0-dryrun"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS bundle
+    runs-on: macos-14
+    env:
+      # Single source of truth for the human-readable tag — the tag-push
+      # path takes it from github.ref_name; the manual dry-run takes it
+      # from the dispatch input.
+      RELAY_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri bundle
+        # `tauri build` reads `bundle.targets` from tauri.conf.json
+        # (["dmg","app"]) and writes both into target/release/bundle.
+        # No signing / notarisation — distribution is unsigned per the
+        # README's Gatekeeper note.
+        run: pnpm tauri build --target aarch64-apple-darwin
+
+      - name: Locate bundles
+        id: bundles
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          DMG_PATH=$(find "$BUNDLE_DIR/dmg" -name "*.dmg" -maxdepth 1 | head -n 1)
+          APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -n 1)
+          if [ -z "$DMG_PATH" ] || [ -z "$APP_PATH" ]; then
+            echo "Expected .dmg and .app under $BUNDLE_DIR but found:"
+            ls -laR "$BUNDLE_DIR" || true
+            exit 1
+          fi
+          # GitHub Releases attach files individually, so `.app` (a
+          # directory bundle) has to be zipped before upload. `ditto -c`
+          # with --sequesterRsrc + --keepParent is the macOS-canonical
+          # way to preserve extended attributes + the wrapper folder.
+          APP_ZIP="${APP_PATH%.app}-${RELAY_TAG}-aarch64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_ZIP"
+          echo "dmg=$DMG_PATH" >> "$GITHUB_OUTPUT"
+          echo "app_zip=$APP_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .dmg + .app.zip to the GitHub Release
+        # `softprops/action-gh-release` creates the Release on first run
+        # for a tag and attaches the listed files. `draft: true` keeps
+        # the release unpublished so we can sanity-check before flipping
+        # the switch in the UI; `fail_on_unmatched_files` catches paths
+        # the previous step somehow produced empty.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELAY_TAG }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.bundles.outputs.dmg }}
+            ${{ steps.bundles.outputs.app_zip }}
