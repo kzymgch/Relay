@@ -67,6 +67,21 @@ pub trait EventSink: Send + Sync {
     fn emit_exit(&self, pane_id: &str, status: ExitStatus);
 }
 
+/// Additional per-pane output observer attached to every spawned PTY. Unlike
+/// [`EventSink`], `observe` sees **pre-coalesce** raw chunks so subscribers
+/// that care about line boundaries (the log writer, the pipe-rule dispatcher)
+/// receive output as it arrives from the reader thread. `on_exit` fires
+/// before the pane's entry is removed from the registry, which lets sinks
+/// flush accumulated state while the source pane is still addressable.
+///
+/// Sinks must be non-blocking — they run inline on the forward task. Defer
+/// expensive work (disk writes, regex matching against a large corpus) onto
+/// their own internal task or queue if needed.
+pub trait PaneOutputSink: Send + Sync {
+    fn observe(&self, pane_id: &str, chunk: &[u8]);
+    fn on_exit(&self, pane_id: &str, status: ExitStatus);
+}
+
 pub struct TauriEventSink {
     app: AppHandle,
 }
@@ -183,11 +198,28 @@ impl PtyRegistry {
 pub struct BridgeState {
     pub registry: Arc<PtyRegistry>,
     pub sink: Arc<dyn EventSink>,
+    pub observers: Vec<Arc<dyn PaneOutputSink>>,
 }
 
 impl BridgeState {
     pub fn new(registry: Arc<PtyRegistry>, sink: Arc<dyn EventSink>) -> Self {
-        Self { registry, sink }
+        Self {
+            registry,
+            sink,
+            observers: Vec::new(),
+        }
+    }
+
+    pub fn with_observers(
+        registry: Arc<PtyRegistry>,
+        sink: Arc<dyn EventSink>,
+        observers: Vec<Arc<dyn PaneOutputSink>>,
+    ) -> Self {
+        Self {
+            registry,
+            sink,
+            observers,
+        }
     }
 }
 
@@ -243,6 +275,7 @@ impl From<PtySpawnConfig> for PtyConfig {
 pub async fn spawn_pty(
     registry: Arc<PtyRegistry>,
     sink: Arc<dyn EventSink>,
+    observers: Vec<Arc<dyn PaneOutputSink>>,
     id: String,
     config: PtyConfig,
 ) -> Result<(), PtyError> {
@@ -258,14 +291,26 @@ pub async fn spawn_pty(
 
     let registry_for_task = registry.clone();
     let sink_for_task = sink;
+    let observers_for_task = observers;
     let id_for_task = id.clone();
 
     tokio::spawn(async move {
-        forward_loop(sink_for_task.as_ref(), &id_for_task, output_rx).await;
+        forward_loop(
+            sink_for_task.as_ref(),
+            observers_for_task.as_slice(),
+            &id_for_task,
+            output_rx,
+        )
+        .await;
         let exit = exit_rx.await.ok();
-        // Drop the registry entry BEFORE emitting `pty:exit` so any observer
-        // that reacts to the event can rely on the invariant that the pane
-        // is gone from the registry.
+        // Fire `on_exit` on every observer BEFORE we drop the registry entry
+        // so onExit pipe rules can still consult the source pane's metadata
+        // and call `PtyRegistry::write` on their (still-live) targets.
+        if let Some(status) = exit {
+            for obs in &observers_for_task {
+                obs.on_exit(&id_for_task, status);
+            }
+        }
         let _ = registry_for_task.take(&id_for_task);
         if let Some(status) = exit {
             sink_for_task.emit_exit(&id_for_task, status);
@@ -275,14 +320,28 @@ pub async fn spawn_pty(
     Ok(())
 }
 
-async fn forward_loop(sink: &dyn EventSink, pane_id: &str, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn forward_loop(
+    sink: &dyn EventSink,
+    observers: &[Arc<dyn PaneOutputSink>],
+    pane_id: &str,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
         // Empty buffer: wait indefinitely for the next chunk.
         if pending.is_empty() {
             match rx.recv().await {
-                Some(chunk) => pending.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    // Fan out the raw chunk to every observer BEFORE we
+                    // accumulate into the coalescing buffer — log writers
+                    // and pipe-rule dispatchers want line-accurate input,
+                    // not 16 ms-grouped bursts.
+                    for obs in observers {
+                        obs.observe(pane_id, &chunk);
+                    }
+                    pending.extend_from_slice(&chunk);
+                }
                 None => return,
             }
         }
@@ -302,6 +361,9 @@ async fn forward_loop(sink: &dyn EventSink, pane_id: &str, mut rx: mpsc::Receive
             tokio::select! {
                 chunk = rx.recv() => match chunk {
                     Some(data) => {
+                        for obs in observers {
+                            obs.observe(pane_id, &data);
+                        }
                         pending.extend_from_slice(&data);
                         if pending.len() >= FLUSH_BYTES {
                             sink.emit_data(pane_id, std::mem::take(&mut pending));
@@ -337,6 +399,7 @@ pub async fn pty_spawn(
     spawn_pty(
         state.registry.clone(),
         state.sink.clone(),
+        state.observers.clone(),
         id,
         config.into(),
     )
@@ -491,6 +554,7 @@ mod tests {
         spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             id.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -530,7 +594,7 @@ mod tests {
         let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
         let sink_for_task = sink.clone();
         let task = tokio::spawn(async move {
-            forward_loop(sink_for_task.as_ref(), "pane-x", rx).await;
+            forward_loop(sink_for_task.as_ref(), &[], "pane-x", rx).await;
         });
 
         // Three small writes in quick succession should be merged into a
@@ -569,7 +633,7 @@ mod tests {
         let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
         let sink_for_task = sink.clone();
         let task = tokio::spawn(async move {
-            forward_loop(sink_for_task.as_ref(), "pane-y", rx).await;
+            forward_loop(sink_for_task.as_ref(), &[], "pane-y", rx).await;
         });
 
         let big = vec![b'A'; FLUSH_BYTES + 1];
@@ -630,6 +694,7 @@ mod tests {
         spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             a.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -644,6 +709,7 @@ mod tests {
         spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             b.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -702,6 +768,7 @@ mod tests {
         spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             id.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -715,6 +782,7 @@ mod tests {
         let err = spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             id.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -808,6 +876,7 @@ mod tests {
         spawn_pty(
             registry.clone(),
             sink.clone(),
+            Vec::new(),
             id.clone(),
             PtyConfig {
                 command: "/bin/sh".into(),
@@ -871,6 +940,7 @@ mod tests {
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                Vec::new(),
                 id1.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
@@ -881,6 +951,7 @@ mod tests {
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                Vec::new(),
                 id2.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
@@ -891,6 +962,7 @@ mod tests {
             spawn_pty(
                 registry.clone(),
                 sink.clone(),
+                Vec::new(),
                 id3.clone(),
                 PtyConfig {
                     command: "/bin/echo".into(),
@@ -927,5 +999,131 @@ mod tests {
         assert!(!text1.contains("pane3"));
         assert!(!text2.contains("pane1"));
         assert!(!text3.contains("pane1"));
+    }
+
+    // ---------------------------------------------------------------------
+    // PaneOutputSink — pre-coalesce fan-out and exit-before-removal
+    // ---------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct CollectingObserver {
+        chunks: Mutex<Vec<(String, Vec<u8>)>>,
+        exits: Mutex<Vec<(String, ExitStatus)>>,
+        registry_known_at_exit: Mutex<Vec<(String, bool)>>,
+        watch_registry: Mutex<Option<Arc<PtyRegistry>>>,
+    }
+
+    impl PaneOutputSink for CollectingObserver {
+        fn observe(&self, pane_id: &str, chunk: &[u8]) {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), chunk.to_vec()));
+        }
+
+        fn on_exit(&self, pane_id: &str, status: ExitStatus) {
+            if let Some(reg) = self.watch_registry.lock().unwrap().as_ref() {
+                self.registry_known_at_exit
+                    .lock()
+                    .unwrap()
+                    .push((pane_id.to_string(), reg.get(pane_id).is_some()));
+            }
+            self.exits
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), status));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_loop_fans_out_to_all_observers_pre_coalesce() {
+        // The observer sees every raw chunk individually, while the frontend
+        // EventSink only sees the coalesced flush. Proves logging / pipe
+        // can rely on per-line input even though the UI sees 16 ms bursts.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+        let obs: Arc<CollectingObserver> = Arc::new(CollectingObserver::default());
+        let observers: Vec<Arc<dyn PaneOutputSink>> = vec![obs.clone()];
+
+        let sink_for_task = sink.clone();
+        let observers_for_task = observers.clone();
+        let task = tokio::spawn(async move {
+            forward_loop(
+                sink_for_task.as_ref(),
+                observers_for_task.as_slice(),
+                "pane-fan",
+                rx,
+            )
+            .await;
+        });
+
+        tx.send(b"alpha\n".to_vec()).await.unwrap();
+        tx.send(b"beta\n".to_vec()).await.unwrap();
+        tx.send(b"gamma\n".to_vec()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(tx);
+        task.await.unwrap();
+
+        // Observer saw all three chunks as separate entries.
+        let chunks = obs.chunks.lock().unwrap().clone();
+        assert_eq!(chunks.len(), 3, "observer should see 3 raw chunks");
+        assert_eq!(chunks[0].1, b"alpha\n".to_vec());
+        assert_eq!(chunks[1].1, b"beta\n".to_vec());
+        assert_eq!(chunks[2].1, b"gamma\n".to_vec());
+
+        // Frontend sink saw them coalesced into a single flush.
+        let merged = sink.data_payload_for("pane-fan");
+        assert_eq!(merged, b"alpha\nbeta\ngamma\n".to_vec());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_on_exit_fires_before_registry_removal() {
+        // Sinks must be able to consult the source pane's registry entry from
+        // on_exit so onExit pipe rules can call write() on the *target* pane
+        // before the source is dropped. We check this by having the observer
+        // record whether `registry.get(pane_id)` resolves at on_exit time.
+        let registry = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+        let obs: Arc<CollectingObserver> = Arc::new(CollectingObserver::default());
+        *obs.watch_registry.lock().unwrap() = Some(registry.clone());
+        let observers: Vec<Arc<dyn PaneOutputSink>> = vec![obs.clone()];
+
+        let id = "pane-onexit".to_string();
+        spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            observers,
+            id.clone(),
+            PtyConfig {
+                command: "/bin/echo".into(),
+                args: vec!["bye".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn");
+
+        // Wait for the exit event so we know the forward task has finished
+        // emitting `on_exit` for the observer.
+        let _ = wait_for_exit(&sink, &id, Duration::from_secs(5)).await;
+
+        // The observer's `registry_known_at_exit` records one entry per
+        // on_exit; for the source pane that entry must be `true`.
+        let known = obs.registry_known_at_exit.lock().unwrap().clone();
+        let our = known
+            .iter()
+            .find(|(p, _)| p == &id)
+            .expect("on_exit fired for pane");
+        assert!(
+            our.1,
+            "registry must still hold the source pane when on_exit fires"
+        );
+
+        // Sanity: by the time the frontend sees pty:exit the registry IS
+        // emptied.
+        assert!(
+            registry.get(&id).is_none(),
+            "registry should drop the source pane after exit is fully processed"
+        );
     }
 }

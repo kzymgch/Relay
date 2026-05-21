@@ -68,6 +68,10 @@ pub fn scrollback_dir(name: &str) -> PathBuf {
     sessions_dir().join(format!("{name}.scrollback"))
 }
 
+pub fn logs_dir() -> PathBuf {
+    config_dir().join("logs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

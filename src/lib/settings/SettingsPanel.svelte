@@ -419,6 +419,71 @@
       </button>
     </section>
 
+    <section class="settings-section" data-testid="settings-logging">
+      <h3>Logging</h3>
+      <label for="settings-logging-enabled">Enabled</label>
+      <input
+        id="settings-logging-enabled"
+        type="checkbox"
+        bind:checked={draft.logging.enabled}
+        data-testid="settings-logging-enabled"
+      />
+      <label for="settings-logging-mode">Mode</label>
+      <select
+        id="settings-logging-mode"
+        bind:value={draft.logging.mode}
+        data-testid="settings-logging-mode"
+      >
+        <option value="plain">Plain (ANSI stripped, secrets masked)</option>
+        <option value="raw">Raw (bytes verbatim)</option>
+      </select>
+      <label for="settings-logging-dir">Directory</label>
+      <input
+        id="settings-logging-dir"
+        type="text"
+        placeholder="(default: ~/.config/relay/logs)"
+        bind:value={draft.logging.dir}
+        data-testid="settings-logging-dir"
+      />
+      <label for="settings-logging-max-bytes">Max bytes per file</label>
+      <input
+        id="settings-logging-max-bytes"
+        type="number"
+        min="0"
+        bind:value={draft.logging.maxBytes}
+        data-testid="settings-logging-max-bytes"
+      />
+      <label for="settings-logging-max-files">Max rotated files</label>
+      <input
+        id="settings-logging-max-files"
+        type="number"
+        min="0"
+        bind:value={draft.logging.maxFiles}
+        data-testid="settings-logging-max-files"
+      />
+      <label for="settings-logging-daily">Daily rotation</label>
+      <input
+        id="settings-logging-daily"
+        type="checkbox"
+        bind:checked={draft.logging.dailyRotation}
+        data-testid="settings-logging-daily"
+      />
+      <label for="settings-logging-secrets">Secret regexes (one per line)</label>
+      <textarea
+        id="settings-logging-secrets"
+        rows="3"
+        value={draft.logging.secrets.join("\n")}
+        oninput={(e) => {
+          const raw = (e.currentTarget as HTMLTextAreaElement).value;
+          draft.logging.secrets = raw
+            .split("\n")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+        }}
+        data-testid="settings-logging-secrets"
+      ></textarea>
+    </section>
+
     <section class="settings-section" data-testid="settings-import-export">
       <h3>Import / Export</h3>
       <label for="settings-export-path">Export to</label>

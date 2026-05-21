@@ -57,6 +57,12 @@ export interface LayoutStore {
    * Rendered off-screen by AppRoot so the Pane component stays mounted.
    */
   readonly detachedPanes: readonly PaneId[];
+  /**
+   * For each pane, the id of the last pane it sent text to (spec §16
+   * status bar — "current send target"). Updated by AppRoot whenever a
+   * send completes. Not persisted; lives only as long as the store.
+   */
+  readonly lastSendTarget: Readonly<Record<PaneId, PaneId>>;
 
   // Queries
   rectsFor(viewport: { w: number; h: number }, gutterPx: number): Record<PaneId, Rect>;
@@ -98,6 +104,8 @@ export interface LayoutStore {
   ): void;
   /** Merge `patch` into the named PaneSpec — label / command / cwd / env edits. */
   updatePaneMeta(paneId: PaneId, patch: Partial<Omit<PaneSpec, "id">>): void;
+  /** Record that `source` last sent text to `target`. */
+  recordSend(source: PaneId, target: PaneId): void;
 
   /**
    * Reshape the tree to match a preset (see `./presets.ts`).
@@ -197,6 +205,10 @@ export function createLayoutStore(
   // Mutated via push/splice — Svelte 5's $state proxy detects array mutations
   // so consumers still re-react.
   const detachedPanes: PaneId[] = $state([]);
+  // `source pane id → last target pane id` — drives the status bar's
+  // "→ target" line. Stored as a plain object behind $state so writes
+  // create new refs and downstream `$derived` recalculates.
+  let lastSendTarget: Record<PaneId, PaneId> = $state({});
   // Reactive Map — Svelte 5's runes don't deep-react to plain Map mutations.
   const customLayouts = new SvelteMap<string, LayoutSnapshot>();
 
@@ -245,6 +257,9 @@ export function createLayoutStore(
     },
     get detachedPanes() {
       return detachedPanes;
+    },
+    get lastSendTarget() {
+      return lastSendTarget;
     },
 
     rectsFor(viewport, gutterPx) {
@@ -320,6 +335,11 @@ export function createLayoutStore(
       const existing = panes[paneId];
       if (!existing) return;
       panes = { ...panes, [paneId]: { ...existing, ...patch } };
+    },
+
+    recordSend(source, target) {
+      if (source === target) return;
+      lastSendTarget = { ...lastSendTarget, [source]: target };
     },
 
     applyPreset(presetId) {

@@ -1,0 +1,30 @@
+/* Status bar — spec §16. Sits at the bottom of AppRoot's flex column. */
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 22px;
+  padding: 0 10px;
+  flex: 0 0 22px;
+  font-size: 11px;
+  line-height: 22px;
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.78);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  user-select: none;
+}
+
+.status-bar-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.status-bar-item .label {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.status-bar-spacer {
+  flex: 1 1 auto;
+}

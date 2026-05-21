@@ -1,0 +1,36 @@
+.logs-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.logs-panel-meta {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.logs-panel-body {
+  padding: 0 12px 12px 12px;
+}
+
+.logs-panel-tail {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: Menlo, Monaco, "Courier New", monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.logs-panel-empty {
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+}

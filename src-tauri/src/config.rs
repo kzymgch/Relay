@@ -31,6 +31,7 @@ pub struct RelayConfig {
     pub send: SendConfig,
     pub scrollback: ScrollbackConfig,
     pub session: SessionSettings,
+    pub logging: LoggingConfig,
     /// `action.id -> "cmd+p"`. Stored verbatim; the actual binding system
     /// lives on the frontend (and full customisation lands in a later PR).
     pub keybind: BTreeMap<String, String>,
@@ -150,6 +151,44 @@ pub struct PaneSection {
     pub preset: Vec<PaneSpecConfig>,
 }
 
+/// Per-pane file logging. Empty `dir` is interpreted at load time as
+/// `paths::logs_dir()` so the config can ship without absolute paths
+/// baked in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LoggingConfig {
+    pub enabled: bool,
+    pub dir: String,
+    /// `"raw"` (write bytes verbatim, ANSI included) or `"plain"`
+    /// (strip ANSI, mask secret regexes line-by-line).
+    pub mode: String,
+    /// Rotate when the current file passes this size. `0` disables size
+    /// rotation; date rotation alone still applies if `daily_rotation`.
+    pub max_bytes: u64,
+    /// How many rotated files to keep per pane. Oldest are pruned first.
+    pub max_files: u32,
+    /// Roll to a fresh file when the local date changes, even if the
+    /// size cap hasn't been hit yet.
+    pub daily_rotation: bool,
+    /// Regex sources applied to plain-mode lines. Each match is replaced
+    /// with `***`. Invalid regexes are rejected by `validate`.
+    pub secrets: Vec<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: String::new(),
+            mode: "plain".into(),
+            max_bytes: 10 * 1024 * 1024,
+            max_files: 5,
+            daily_rotation: true,
+            secrets: Vec::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -234,6 +273,21 @@ pub fn validate(cfg: &RelayConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Validation(
             "defaultPane.command must not be empty".into(),
         ));
+    }
+    match cfg.logging.mode.as_str() {
+        "raw" | "plain" => {}
+        other => {
+            return Err(ConfigError::Validation(format!(
+                "logging.mode must be \"raw\" or \"plain\", got {other:?}"
+            )))
+        }
+    }
+    for (idx, src) in cfg.logging.secrets.iter().enumerate() {
+        if let Err(e) = regex::Regex::new(src) {
+            return Err(ConfigError::Validation(format!(
+                "logging.secrets[{idx}] is not a valid regex: {e}"
+            )));
+        }
     }
     Ok(())
 }
@@ -515,6 +569,37 @@ mod tests {
         cfg.font.size = 20;
         store.save(cfg.clone()).expect("save");
         assert_eq!(store.snapshot(), cfg);
+    }
+
+    #[test]
+    fn logging_config_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = RelayConfig::default();
+        cfg.logging.enabled = true;
+        cfg.logging.dir = "/tmp/relay-logs".into();
+        cfg.logging.mode = "raw".into();
+        cfg.logging.max_bytes = 1024;
+        cfg.logging.max_files = 3;
+        cfg.logging.daily_rotation = false;
+        cfg.logging.secrets = vec!["sk-[A-Za-z0-9]+".into()];
+        save(&path, &cfg).expect("save");
+        let back = load_or_default(&path).expect("load");
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn invalid_logging_mode_rejected() {
+        let mut cfg = RelayConfig::default();
+        cfg.logging.mode = "weird".into();
+        assert!(matches!(validate(&cfg), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn invalid_secret_regex_rejected() {
+        let mut cfg = RelayConfig::default();
+        cfg.logging.secrets = vec!["(unterminated".into()];
+        assert!(matches!(validate(&cfg), Err(ConfigError::Validation(_))));
     }
 
     #[test]
