@@ -29,12 +29,12 @@ const xtermMocks = vi.hoisted(() => {
   class MockTerminal {
     cols = 80;
     rows = 24;
-    options: unknown;
+    options: Record<string, unknown>;
     addons: unknown[] = [];
     openedOn: HTMLElement | null = null;
 
-    constructor(options: unknown) {
-      this.options = options;
+    constructor(options: Record<string, unknown>) {
+      this.options = { ...options };
       state.instances.push(this);
     }
 
@@ -208,6 +208,61 @@ describe("Terminal component", () => {
       cb({ cols: 120, rows: 40 });
     }
     expect(resizeHandler).toHaveBeenCalledWith(120, 40);
+  });
+
+  it("subscribes to onResize before the initial fit", async () => {
+    // If fit() runs first and triggers term.resize(), our onResize listener
+    // hasn't been attached yet and the initial size is lost. We catch that
+    // here by comparing the call ordinals from vi.fn's invocationCallOrder.
+    await mount();
+    const term = xtermMocks.state.instances.at(-1)!;
+    const fitAddon = term.addons.find(
+      (a) => (a as { constructor: { name: string } }).constructor.name === "MockFitAddon"
+    ) as { fit: ReturnType<typeof vi.fn> };
+
+    const onResizeOrder = term.onResize.mock.invocationCallOrder[0];
+    const fitOrder = fitAddon.fit.mock.invocationCallOrder[0];
+    expect(onResizeOrder).toBeDefined();
+    expect(fitOrder).toBeDefined();
+    expect(onResizeOrder).toBeLessThan(fitOrder);
+  });
+
+  it("propagates reactive prop changes to xterm.options", async () => {
+    // mount() doesn't accept theme/fontSize via the helper; call render
+    // directly so we can also use rerender().
+    let api: TerminalApi | undefined;
+    const onready = (a: TerminalApi) => {
+      api = a;
+    };
+    const { rerender } = render(Terminal, {
+      props: {
+        onready,
+        fontSize: 14,
+        fontFamily: "Menlo, monospace",
+        cursorBlink: true,
+        theme: { background: "#111" },
+      },
+    });
+    await vi.waitFor(() => expect(api).toBeDefined());
+
+    const term = xtermMocks.state.instances.at(-1)!;
+    expect(term.options.fontSize).toBe(14);
+    expect(term.options.fontFamily).toBe("Menlo, monospace");
+    expect(term.options.cursorBlink).toBe(true);
+    expect(term.options.theme).toEqual({ background: "#111" });
+
+    await rerender({
+      onready,
+      fontSize: 18,
+      fontFamily: "Fira Code, monospace",
+      cursorBlink: false,
+      theme: { background: "#fff" },
+    });
+
+    expect(term.options.fontSize).toBe(18);
+    expect(term.options.fontFamily).toBe("Fira Code, monospace");
+    expect(term.options.cursorBlink).toBe(false);
+    expect(term.options.theme).toEqual({ background: "#fff" });
   });
 
   it("unmount disposes the xterm instance", async () => {

@@ -22,11 +22,12 @@
   }: TerminalProps = $props();
 
   let containerEl: HTMLDivElement | undefined = $state();
+  let term: XTerm | undefined = $state();
 
   onMount(() => {
     if (!containerEl) return;
 
-    const term = new XTerm({
+    const t = new XTerm({
       theme,
       fontFamily,
       fontSize,
@@ -40,12 +41,17 @@
     const search = new SearchAddon();
     const serializer = new SerializeAddon();
 
-    term.loadAddon(fit);
-    term.loadAddon(webLinks);
-    term.loadAddon(search);
-    term.loadAddon(serializer);
+    t.loadAddon(fit);
+    t.loadAddon(webLinks);
+    t.loadAddon(search);
+    t.loadAddon(serializer);
 
-    term.open(containerEl);
+    // Subscribe before opening / fitting so the resize event triggered by the
+    // initial sizing is delivered to the parent.
+    const dataDisposable = t.onData((d) => ondata?.(d));
+    const resizeDisposable = t.onResize(({ cols, rows }) => onresize?.(cols, rows));
+
+    t.open(containerEl);
 
     const safeFit = () => {
       try {
@@ -57,37 +63,59 @@
     };
     safeFit();
 
-    const dataDisposable = term.onData((d) => ondata?.(d));
-    const resizeDisposable = term.onResize(({ cols, rows }) => onresize?.(cols, rows));
-
     const observer = new ResizeObserver(() => safeFit());
     observer.observe(containerEl);
 
     const api: TerminalApi = {
-      write: (d) => term.write(d),
-      clear: () => term.clear(),
-      focus: () => term.focus(),
+      write: (d) => t.write(d),
+      clear: () => t.clear(),
+      focus: () => t.focus(),
       fit: safeFit,
-      paste: (d) => term.paste(d),
+      paste: (d) => t.paste(d),
       serialize: () => serializer.serialize(),
       findNext: (q) => search.findNext(q),
       findPrevious: (q) => search.findPrevious(q),
       get cols() {
-        return term.cols;
+        return t.cols;
       },
       get rows() {
-        return term.rows;
+        return t.rows;
       },
     };
 
+    term = t;
     onready?.(api);
 
     return () => {
       observer.disconnect();
       dataDisposable.dispose();
       resizeDisposable.dispose();
-      term.dispose();
+      t.dispose();
+      term = undefined;
     };
+  });
+
+  // Reactive option updates. Each effect re-runs when the corresponding prop
+  // changes; xterm's `options` setter applies the change incrementally.
+  $effect(() => {
+    if (term && theme !== undefined) {
+      term.options.theme = theme;
+    }
+  });
+  $effect(() => {
+    if (term && fontFamily !== undefined) {
+      term.options.fontFamily = fontFamily;
+    }
+  });
+  $effect(() => {
+    if (term && fontSize !== undefined) {
+      term.options.fontSize = fontSize;
+    }
+  });
+  $effect(() => {
+    if (term && cursorBlink !== undefined) {
+      term.options.cursorBlink = cursorBlink;
+    }
   });
 </script>
 

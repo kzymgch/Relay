@@ -21,11 +21,19 @@ export interface TerminalApi {
 }
 
 export interface TerminalProps {
+  /** Reactive — re-applied to the live terminal whenever the prop changes. */
   theme?: ITheme;
+  /** Reactive — re-applied to the live terminal whenever the prop changes. */
   fontFamily?: string;
+  /** Reactive — re-applied to the live terminal whenever the prop changes. */
   fontSize?: number;
-  scrollback?: number;
+  /** Reactive — re-applied to the live terminal whenever the prop changes. */
   cursorBlink?: boolean;
+  /**
+   * Init-only. Changing this prop after mount has no effect; resizing the
+   * scrollback buffer at runtime can drop history, so we don't expose it.
+   */
+  scrollback?: number;
   ondata?: (data: string) => void;
   onresize?: (cols: number, rows: number) => void;
   onready?: (api: TerminalApi) => void;
