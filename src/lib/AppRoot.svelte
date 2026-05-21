@@ -6,14 +6,52 @@
   import { createLayoutStore } from "./layout/store.svelte";
   import { PRESETS, threePanePreset } from "./layout/presets";
   import Splitter from "./layout/Splitter.svelte";
-  import type { PaneId, SplitterInfo } from "./layout/tree";
+  import type { PaneId, PaneSpec, SplitterInfo } from "./layout/tree";
+  import { createConfigStore } from "./config.svelte";
+  import {
+    deleteSession as deleteSessionRust,
+    installAutosave,
+    listSessions,
+    loadSession as loadSessionRust,
+    readAutosave,
+    saveSession as saveSessionRust,
+    serializeSession,
+    type LayoutPayload,
+    type SessionMetadata,
+  } from "./sessions";
+  import CommandPalette from "./palette/CommandPalette.svelte";
+  import { buildActions, type PaletteAction, type PaletteHooks } from "./palette/actions";
+  import SettingsPanel from "./settings/SettingsPanel.svelte";
   import "./app-root.css";
   import "./layout/splitter.css";
+
+  // Config-driven default for newly-minted panes. Resolved lazily so the
+  // factory captures the *current* config snapshot — that way a user edit to
+  // `defaultPane.command` flows into the next split / preset growth without
+  // rebuilding the store.
+  function configDefaultPaneSpec(label: string, id: PaneId): PaneSpec {
+    const dp = config.current.defaultPane;
+    return {
+      id,
+      label,
+      command: dp.command,
+      ...(dp.args.length > 0 && { args: dp.args }),
+      ...(dp.cwd && { cwd: dp.cwd }),
+      ...(Object.keys(dp.env).length > 0 && { env: dp.env }),
+    };
+  }
+
+  // Config store comes first because the layout-store factory closes over
+  // `configDefaultPaneSpec`. Both attach asynchronously in `onMount` — see
+  // below — so the synchronous defaults here are just the boot state.
+  const config = createConfigStore();
 
   // Single source of truth for the layout tree, pane specs, and focus. The
   // store wraps the pure transforms in `./layout/tree.ts` and exposes derived
   // `paneOrder` (DFS) which drives Cmd+1..N + send target labelling.
-  const store = createLayoutStore(threePanePreset());
+  const store = createLayoutStore(threePanePreset(), {
+    defaultPaneSpec: configDefaultPaneSpec,
+  });
 
   const DEFAULT_FONT_SIZE = 13;
   const MIN_FONT_SIZE = 8;
@@ -48,6 +86,135 @@
 
   let sendOptions: SendOptions = $state({ ...DEFAULT_SEND_OPTIONS });
   const history = new SendHistory();
+
+  // One-way sync from the config store into the reactive UI state. The
+  // guards keep this idempotent — when Cmd+=/-/0 update config below, the
+  // resulting reactive write here is a no-op so no flicker. External
+  // edits to ~/.config/relay/config.toml (hot reload) flow through here
+  // automatically.
+  $effect(() => {
+    const target = clampFontSize(config.current.font.size);
+    if (fontSize !== target) fontSize = target;
+  });
+  $effect(() => {
+    const next = config.current.send;
+    if (
+      sendOptions.bracketedPaste !== next.bracketedPaste ||
+      sendOptions.trailingNewline !== next.trailingNewline
+    ) {
+      sendOptions = { bracketedPaste: next.bracketedPaste, trailingNewline: next.trailingNewline };
+    }
+  });
+
+  /**
+   * Persist a font-size change back to config so the next launch (and any
+   * other window) sees it. Fire-and-forget: the visible update already
+   * happened locally; the await is just for error logging.
+   */
+  function persistFontSize(size: number): void {
+    if (config.current.font.size === size) return;
+    void config
+      .update({ font: { ...config.current.font, size } })
+      .catch((e) => console.error("[app] persist font size failed", e));
+  }
+
+  /**
+   * Build the current SessionData blob from the layout + send options. Used
+   * both by autosave (visibilitychange / beforeunload) and Settings → Save
+   * named session.
+   */
+  function snapshotSession(name = "") {
+    const snap = store.exportSnapshot();
+    return serializeSession(
+      {
+        tree: snap.tree,
+        panes: snap.panes,
+        focusedPaneId: snap.focusedPaneId,
+        customLayouts: store.customLayouts,
+      },
+      sendOptions,
+      name
+    );
+  }
+
+  function applyLayoutPayload(layout: LayoutPayload): void {
+    store.importSnapshot({
+      tree: layout.tree,
+      panes: layout.panes,
+      focusedPaneId: layout.focusedPaneId,
+      customLayouts: layout.customLayouts,
+    });
+  }
+
+  // --- Command palette ---
+
+  let paletteOpen: boolean = $state(false);
+  let paletteActions: PaletteAction[] = $state([]);
+  let sessionCatalog: SessionMetadata[] = $state([]);
+  let settingsOpen: boolean = $state(false);
+
+  async function refreshSessions(): Promise<void> {
+    try {
+      sessionCatalog = await listSessions();
+    } catch {
+      sessionCatalog = [];
+    }
+  }
+
+  const paletteHooks: PaletteHooks = {
+    async sendToPane(targetId) {
+      await sendSelection(store.focusedPaneId, targetId);
+    },
+    async saveSession() {
+      const name = window.prompt("Save session as:");
+      if (!name) return;
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      await saveSessionRust(trimmed, snapshotSession(trimmed));
+      await refreshSessions();
+    },
+    async loadSession(name) {
+      const data = await loadSessionRust(name);
+      if (!data?.layout) return;
+      applyLayoutPayload(data.layout);
+      if (data.sendOptions) {
+        sendOptions = {
+          bracketedPaste: data.sendOptions.bracketedPaste,
+          trailingNewline: data.sendOptions.trailingNewline,
+        };
+      }
+    },
+    async deleteSession(name) {
+      await deleteSessionRust(name);
+      await refreshSessions();
+    },
+    openSettings() {
+      settingsOpen = true;
+    },
+    bumpFont(delta) {
+      fontSize = clampFontSize(fontSize + delta * FONT_STEP);
+      persistFontSize(fontSize);
+    },
+    resetFont() {
+      fontSize = DEFAULT_FONT_SIZE;
+      persistFontSize(fontSize);
+    },
+  };
+
+  async function openPalette(): Promise<void> {
+    await refreshSessions();
+    paletteActions = buildActions({
+      store,
+      config: config.current,
+      sessions: sessionCatalog,
+      hooks: paletteHooks,
+    });
+    paletteOpen = true;
+  }
+
+  function closePalette(): void {
+    paletteOpen = false;
+  }
 
   // Viewport dimensions for the absolute-positioning layer. `bind:clientWidth`
   // is reactive, but its underlying `ResizeObserver` is stubbed in vitest
@@ -231,14 +398,17 @@
       case "Equal":
         event.preventDefault();
         fontSize = clampFontSize(fontSize + FONT_STEP);
+        persistFontSize(fontSize);
         return;
       case "Minus":
         event.preventDefault();
         fontSize = clampFontSize(fontSize - FONT_STEP);
+        persistFontSize(fontSize);
         return;
       case "Digit0":
         event.preventDefault();
         fontSize = DEFAULT_FONT_SIZE;
+        persistFontSize(fontSize);
         return;
     }
 
@@ -262,6 +432,19 @@
     }
     if (event.shiftKey) return;
 
+    // Modal hotkeys are routed by `event.code` (physical key) for the same
+    // layout-stability reason as Cmd+1..N. Cmd+P / Cmd+, are spec §13.
+    switch (event.code) {
+      case "KeyP":
+        event.preventDefault();
+        void openPalette();
+        return;
+      case "Comma":
+        event.preventDefault();
+        settingsOpen = true;
+        return;
+    }
+
     const focused = handles[store.focusedPaneId];
     switch (event.key) {
       case "k":
@@ -284,8 +467,61 @@
 
   onMount(() => {
     window.addEventListener("keydown", handleKeydown);
+
+    // Async bootstrap. Each step is wrapped so a missing IPC backend (the
+    // Vitest mock returns undefined for everything) silently keeps the
+    // synchronous defaults instead of breaking the mount.
+    let unsubConfig: (() => void) | undefined;
+    let teardownAutosave: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        unsubConfig = await config.attach();
+      } catch {
+        /* stay on defaults */
+      }
+      // The two `$effect` blocks above mirror config → fontSize and
+      // config → sendOptions, so no explicit assignment is needed here —
+      // the await resolves, `config.current` updates, the effects fire.
+
+      // Restore the previous session if the user has opted in (default on)
+      // and an autosave file exists. Honoured before installing the new
+      // listeners so an immediate quit doesn't overwrite the prior dump
+      // with the boot snapshot.
+      if (config.current.session.restoreOnLaunch) {
+        try {
+          const prev = await readAutosave();
+          if (prev?.layout?.tree && prev.layout.panes) {
+            applyLayoutPayload(prev.layout);
+            if (prev.sendOptions) {
+              // Session-recorded send options outrank the config copy — the
+              // user explicitly chose them last run.
+              sendOptions = {
+                bracketedPaste: prev.sendOptions.bracketedPaste,
+                trailingNewline: prev.sendOptions.trailingNewline,
+              };
+            }
+          }
+        } catch {
+          /* ignore restore failures */
+        }
+      }
+
+      teardownAutosave = installAutosave({
+        snapshot: () => snapshotSession(),
+        enabled: () => config.current.session.autosaveOnExit,
+      });
+    })();
+
     return () => {
       window.removeEventListener("keydown", handleKeydown);
+      unsubConfig?.();
+      teardownAutosave?.();
+      // Intentionally NO autosave write here — unmount also fires during
+      // HMR / test cleanup, both of which would overwrite a legitimate
+      // previous-session file with whatever ephemeral state the test had.
+      // visibilitychange + beforeunload cover the real "user is leaving"
+      // paths.
     };
   });
 </script>
@@ -399,4 +635,6 @@
       />
     {/each}
   </div>
+  <CommandPalette open={paletteOpen} actions={paletteActions} onclose={closePalette} />
+  <SettingsPanel open={settingsOpen} {config} onclose={() => (settingsOpen = false)} />
 </div>
