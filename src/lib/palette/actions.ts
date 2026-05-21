@@ -21,6 +21,18 @@ export interface PaletteAction {
   run(): void | Promise<void>;
 }
 
+/** Section ids understood by `SettingsPanel.initialSection`. */
+export type SettingsSection =
+  | "font"
+  | "send"
+  | "scrollback"
+  | "session"
+  | "default-pane"
+  | "pane-presets"
+  | "theme"
+  | "keybind"
+  | "import-export";
+
 export interface PaletteHooks {
   /** Send the focused pane's current selection to `targetId`. */
   sendToPane(targetId: string): Promise<void>;
@@ -30,8 +42,12 @@ export interface PaletteHooks {
   loadSession(name: string): Promise<void>;
   /** Delete a named session from disk. */
   deleteSession(name: string): Promise<void>;
-  /** Open the in-app settings panel. */
-  openSettings(): void;
+  /**
+   * Open the in-app settings panel. When `section` is given, the panel
+   * scrolls that section into view so the palette's "Settings: Font / Send
+   * / …" entries deep-link.
+   */
+  openSettings(section?: SettingsSection): void;
   /** Bump font size by `delta` (positive = larger). */
   bumpFont(delta: number): void;
   /** Reset font size to its default. */
@@ -186,6 +202,28 @@ export function buildActions(input: BuildActionsInput): PaletteAction[] {
     hint: "⌘,",
     run: () => hooks.openSettings(),
   });
+  // Per-section deep links. spec §14 lists "設定項目検索" — a single
+  // "Settings…" entry doesn't satisfy that, so we surface one row per
+  // section. Each opens the panel scrolled to its section.
+  const sections: { id: SettingsSection; label: string }[] = [
+    { id: "font", label: "Settings: Font" },
+    { id: "send", label: "Settings: Send options" },
+    { id: "scrollback", label: "Settings: Scrollback" },
+    { id: "session", label: "Settings: Session (autosave / restore)" },
+    { id: "default-pane", label: "Settings: Default pane" },
+    { id: "pane-presets", label: "Settings: Pane presets" },
+    { id: "theme", label: "Settings: Theme" },
+    { id: "keybind", label: "Settings: Keybindings" },
+    { id: "import-export", label: "Settings: Import / Export" },
+  ];
+  for (const s of sections) {
+    out.push({
+      id: `settings.open.${s.id}`,
+      label: s.label,
+      group: "settings",
+      run: () => hooks.openSettings(s.id),
+    });
+  }
 
   return out;
 }

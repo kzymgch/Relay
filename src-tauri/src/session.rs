@@ -126,6 +126,14 @@ impl SessionStore {
         self.sessions_dir.join(format!("{name}.scrollback"))
     }
 
+    /// Directory holding per-pane scrollback dumps for the *autosave* slot.
+    /// Lives next to `autosave.json` (mirroring the named-session layout)
+    /// rather than under `sessions/` so the two sets stay logically
+    /// distinct on disk.
+    pub fn autosave_scrollback_dir(&self) -> PathBuf {
+        self.autosave_path.with_extension("scrollback")
+    }
+
     fn pane_count(layout: &serde_json::Value) -> usize {
         // Layout is opaque JSON to Rust, but for the metadata listing we
         // optimistically pull `panes.<id>` keys. Falls back to 0 if the
@@ -263,6 +271,51 @@ impl SessionStore {
             Err(err) => Err(SessionError::Io(err)),
         }
     }
+
+    /// Autosave variant of `write_scrollback`. No `validate_name` — the
+    /// "name" is implicit (the autosave slot), so the frontend supplies
+    /// only the pane id.
+    pub fn write_autosave_scrollback(
+        &self,
+        pane_id: &str,
+        bytes: &[u8],
+        max_bytes: u64,
+    ) -> Result<(), SessionError> {
+        let dir = self.autosave_scrollback_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{pane_id}.bin"));
+        let cap = max_bytes as usize;
+        let slice = if bytes.len() > cap {
+            &bytes[bytes.len() - cap..]
+        } else {
+            bytes
+        };
+        std::fs::write(&path, slice)?;
+        Ok(())
+    }
+
+    pub fn read_autosave_scrollback(&self, pane_id: &str) -> Result<Vec<u8>, SessionError> {
+        let path = self
+            .autosave_scrollback_dir()
+            .join(format!("{pane_id}.bin"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(err) => Err(SessionError::Io(err)),
+        }
+    }
+
+    /// Wipe the autosave scrollback dir. Used when the user disables
+    /// scrollback persistence so the next autosave run doesn't leak old
+    /// dumps that no longer correspond to live panes.
+    pub fn clear_autosave_scrollback(&self) -> Result<(), SessionError> {
+        let dir = self.autosave_scrollback_dir();
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(SessionError::Io(err)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +400,35 @@ pub fn session_scrollback_read(
     state
         .read_scrollback(&name, &pane_id)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_autosave_scrollback_write(
+    state: State<'_, Arc<SessionStore>>,
+    pane_id: String,
+    bytes: Vec<u8>,
+    max_bytes: u64,
+) -> Result<(), String> {
+    state
+        .write_autosave_scrollback(&pane_id, &bytes, max_bytes)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_autosave_scrollback_read(
+    state: State<'_, Arc<SessionStore>>,
+    pane_id: String,
+) -> Result<Vec<u8>, String> {
+    state
+        .read_autosave_scrollback(&pane_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_autosave_scrollback_clear(
+    state: State<'_, Arc<SessionStore>>,
+) -> Result<(), String> {
+    state.clear_autosave_scrollback().map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +548,45 @@ mod tests {
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn autosave_scrollback_round_trip_with_cap() {
+        let (_dir, store) = fresh_store();
+        let mut bytes = Vec::new();
+        for i in 0..500u32 {
+            bytes.extend_from_slice(format!("row {i}\n").as_bytes());
+        }
+        let cap = 120u64;
+        store
+            .write_autosave_scrollback("pane-1", &bytes, cap)
+            .expect("write");
+        let back = store.read_autosave_scrollback("pane-1").expect("read");
+        assert_eq!(back.len(), cap as usize);
+        // The tail (newest output) survives the truncation.
+        assert!(String::from_utf8_lossy(&back).contains("row 499"));
+    }
+
+    #[test]
+    fn read_autosave_scrollback_missing_returns_empty() {
+        let (_dir, store) = fresh_store();
+        let back = store
+            .read_autosave_scrollback("never-written")
+            .expect("read");
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn clear_autosave_scrollback_removes_dir() {
+        let (_dir, store) = fresh_store();
+        store
+            .write_autosave_scrollback("pane-1", b"hi", 1024)
+            .expect("write");
+        assert!(store.autosave_scrollback_dir().exists());
+        store.clear_autosave_scrollback().expect("clear");
+        assert!(!store.autosave_scrollback_dir().exists());
+        // Clearing twice is a no-op.
+        store.clear_autosave_scrollback().expect("clear-again");
     }
 
     #[test]

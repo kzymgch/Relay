@@ -10,9 +10,11 @@ import {
   listSessions,
   loadSession,
   readAutosave,
+  readAutosaveScrollback,
   saveSession,
   serializeSession,
   writeAutosave,
+  writeAutosaveScrollback,
   type SessionData,
 } from "../src/lib/sessions";
 import type { LayoutSnapshot } from "../src/lib/layout/tree";
@@ -138,7 +140,70 @@ describe("session command wrappers", () => {
   });
 });
 
+describe("autosave scrollback wrappers", () => {
+  it("writes per-pane bytes and maxBytes through the bridge", async () => {
+    captureWith();
+    const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+    await writeAutosaveScrollback("pane-1", bytes, 1024);
+    expect(calls[0]).toEqual({
+      cmd: "session_autosave_scrollback_write",
+      args: { paneId: "pane-1", bytes: [1, 2, 3, 4, 5], maxBytes: 1024 },
+    });
+  });
+
+  it("decodes the returned byte array into a Uint8Array", async () => {
+    captureWith((cmd) => {
+      if (cmd === "session_autosave_scrollback_read") return [9, 8, 7];
+      return undefined;
+    });
+    const back = await readAutosaveScrollback("pane-1");
+    expect(back).toBeInstanceOf(Uint8Array);
+    expect(Array.from(back)).toEqual([9, 8, 7]);
+  });
+});
+
 describe("installAutosave", () => {
+  it("calls persistScrollback before snapshot and stamps the resulting keys", async () => {
+    captureWith();
+    const baseData: SessionData = {
+      layout: {
+        tree: fixtureLayout().tree,
+        panes: fixtureLayout().panes,
+        focusedPaneId: "a",
+        customLayouts: {},
+      },
+      sendOptions: null,
+      rules: [],
+      scrollbackKeys: [],
+      savedAt: "",
+      name: "",
+    };
+    const order: string[] = [];
+    const teardown = installAutosave({
+      snapshot: () => {
+        order.push("snapshot");
+        return { ...baseData };
+      },
+      enabled: () => true,
+      persistScrollback: async () => {
+        order.push("persistScrollback");
+        return ["pane-a", "pane-b"];
+      },
+    });
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.waitFor(() => {
+      expect(calls.find((c) => c.cmd === "session_autosave_write")).toBeDefined();
+    });
+    expect(order).toEqual(["persistScrollback", "snapshot"]);
+    const write = calls.find((c) => c.cmd === "session_autosave_write")!;
+    expect((write.args as { data: SessionData }).data.scrollbackKeys).toEqual(["pane-a", "pane-b"]);
+    teardown();
+  });
+
   it("writes on visibilitychange when enabled, skips when disabled", async () => {
     let enabled = true;
     let snapCalls = 0;

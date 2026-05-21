@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 
 import { defaultConfig, loadConfig, saveConfig, type RelayConfig } from "../src/lib/config";
+import { createConfigStore } from "../src/lib/config.svelte";
 
 interface Call {
   cmd: string;
@@ -55,5 +56,31 @@ describe("config bridge", () => {
     cfg.session.autosaveOnExit = false;
     await saveConfig(cfg);
     expect(calls[0]).toEqual({ cmd: "config_save", args: { config: cfg } });
+  });
+});
+
+describe("createConfigStore", () => {
+  it("does not leak unvalidated state on save failure", async () => {
+    // Simulate Rust rejecting the config (validation, IO). The thrown
+    // error must NOT have updated the reactive `current`.
+    captureWith((cmd) => {
+      if (cmd === "config_save") {
+        throw new Error("font.size must be in 8..=32");
+      }
+      return undefined;
+    });
+    const store = createConfigStore();
+    const original = store.current;
+    const broken: RelayConfig = { ...original, font: { ...original.font, size: 999 } };
+    await expect(store.set(broken)).rejects.toThrow();
+    expect(store.current.font.size).toBe(original.font.size);
+  });
+
+  it("commits the reactive copy on save success", async () => {
+    captureWith();
+    const store = createConfigStore();
+    const next: RelayConfig = { ...store.current, font: { ...store.current.font, size: 20 } };
+    await store.set(next);
+    expect(store.current.font.size).toBe(20);
   });
 });

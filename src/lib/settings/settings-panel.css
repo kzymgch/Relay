@@ -76,3 +76,46 @@
   font-style: italic;
   font-size: 12px;
 }
+.settings-presets {
+  grid-template-columns: 1fr;
+}
+.settings-presets-help {
+  margin-bottom: 4px;
+}
+.settings-preset-row {
+  display: grid;
+  grid-template-columns: 1.3fr 1.5fr 2fr 1.5fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.settings-preset-row input {
+  width: 100%;
+  background: #2b2d31;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+}
+.settings-preset-remove {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 6px;
+}
+.settings-preset-add {
+  justify-self: start;
+  background: #2b2d31;
+  color: inherit;
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.settings-section.highlight {
+  outline: 2px solid #3b6ef0;
+  transition: outline-color 600ms ease-out;
+}

@@ -1,7 +1,16 @@
 <script lang="ts">
+  import { tick } from "svelte";
+
   import Modal from "../Modal.svelte";
-  import { defaultConfig, exportConfig, importConfig, type RelayConfig } from "../config";
+  import {
+    defaultConfig,
+    exportConfig,
+    importConfig,
+    type PaneSpecConfig,
+    type RelayConfig,
+  } from "../config";
   import type { ConfigStore } from "../config.svelte";
+  import type { SettingsSection } from "../palette/actions";
 
   import "./settings-panel.css";
 
@@ -9,9 +18,11 @@
     open: boolean;
     config: ConfigStore;
     onclose: () => void;
+    /** Optional deep-link target from the palette's "Settings: <section>" rows. */
+    initialSection?: SettingsSection | null;
   }
 
-  let { open, config, onclose }: Props = $props();
+  let { open, config, onclose, initialSection = null }: Props = $props();
 
   // Draft is the form state. Initialised lazily from the live config when
   // the modal opens (via `$effect` below), so unsaved edits aren't visible
@@ -19,22 +30,73 @@
   // built-in defaults so the form has well-formed values before the first
   // open.
   let draft: RelayConfig = $state(defaultConfig());
+  // Args / env are arrays / records in the model but space-separated /
+  // newline-separated strings in the form for ergonomics. Kept as separate
+  // drafts so we don't have to round-trip through join/split on every
+  // keystroke (which would fight the user's cursor in the textarea).
+  let defaultPaneArgsRaw: string = $state("");
+  let presetArgsRaw: string[] = $state([]);
   let importPath: string = $state("");
   let exportPath: string = $state("");
   let lastStatus: string = $state("");
 
   $effect(() => {
-    if (open) {
-      // `$state.snapshot()` strips Svelte 5's reactive proxy so the result
-      // is a plain object — needed because `structuredClone` chokes on the
-      // proxy and because the draft is intentionally a *detached* copy.
-      draft = $state.snapshot(config.current) as RelayConfig;
-      lastStatus = "";
+    if (!open) return;
+    // Read all derived values from a local, non-reactive snapshot so the
+    // subsequent writes to `draft` / `defaultPaneArgsRaw` / `presetArgsRaw`
+    // don't create a read-after-write loop in this effect.
+    // (`$state.snapshot()` strips Svelte 5's reactive proxy.)
+    const snap = $state.snapshot(config.current) as RelayConfig;
+    draft = snap;
+    defaultPaneArgsRaw = snap.defaultPane.args.join(" ");
+    presetArgsRaw = snap.pane.preset.map((p) => p.args.join(" "));
+    lastStatus = "";
+    if (initialSection) {
+      void tick().then(() => scrollToSection(initialSection));
     }
   });
 
+  function scrollToSection(section: SettingsSection): void {
+    const id = `settings-${section}`;
+    const el = document.querySelector(`[data-testid="${id}"]`);
+    if (el instanceof HTMLElement) {
+      el.scrollIntoView({ block: "start", behavior: "auto" });
+      // Subtle highlight so the user sees where the palette landed them.
+      el.classList.add("highlight");
+      setTimeout(() => el.classList.remove("highlight"), 800);
+    }
+  }
+
+  function parseSpaceArgs(raw: string): string[] {
+    return raw.trim() === "" ? [] : raw.trim().split(/\s+/);
+  }
+
+  function addPreset(): void {
+    const next: PaneSpecConfig = {
+      label: "new preset",
+      command: "/bin/zsh",
+      args: ["-l"],
+      cwd: null,
+      env: {},
+    };
+    draft.pane.preset = [...draft.pane.preset, next];
+    presetArgsRaw = [...presetArgsRaw, next.args.join(" ")];
+  }
+
+  function removePreset(idx: number): void {
+    draft.pane.preset = draft.pane.preset.filter((_, i) => i !== idx);
+    presetArgsRaw = presetArgsRaw.filter((_, i) => i !== idx);
+  }
+
   async function save(): Promise<void> {
     try {
+      // Re-derive args from the raw text just before persisting so the
+      // user's edits inside the input fields make it onto the wire.
+      draft.defaultPane.args = parseSpaceArgs(defaultPaneArgsRaw);
+      draft.pane.preset = draft.pane.preset.map((p, i) => ({
+        ...p,
+        args: parseSpaceArgs(presetArgsRaw[i] ?? ""),
+      }));
       await config.set(draft);
       lastStatus = "Saved.";
     } catch (e) {
@@ -181,6 +243,82 @@
         bind:value={draft.defaultPane.command}
         data-testid="settings-default-command"
       />
+      <label for="settings-default-args">Args</label>
+      <input
+        id="settings-default-args"
+        type="text"
+        placeholder="space-separated"
+        bind:value={defaultPaneArgsRaw}
+        data-testid="settings-default-args"
+      />
+      <label for="settings-default-cwd">cwd</label>
+      <input
+        id="settings-default-cwd"
+        type="text"
+        placeholder="(inherit)"
+        value={draft.defaultPane.cwd ?? ""}
+        oninput={(e) => {
+          const v = (e.currentTarget as HTMLInputElement).value;
+          draft.defaultPane.cwd = v.trim() === "" ? null : v;
+        }}
+        data-testid="settings-default-cwd"
+      />
+    </section>
+
+    <section class="settings-section settings-presets" data-testid="settings-pane-presets">
+      <h3>Pane presets</h3>
+      <span class="settings-readonly settings-presets-help">
+        Entries surfaced as "Add pane: &lt;label&gt;" in the command palette.
+      </span>
+      {#each draft.pane.preset as preset, idx (idx)}
+        <div class="settings-preset-row" data-testid={`settings-pane-preset-${idx}`}>
+          <input
+            type="text"
+            placeholder="label"
+            bind:value={preset.label}
+            data-testid={`settings-pane-preset-label-${idx}`}
+          />
+          <input
+            type="text"
+            placeholder="command"
+            bind:value={preset.command}
+            data-testid={`settings-pane-preset-command-${idx}`}
+          />
+          <input
+            type="text"
+            placeholder="args (space-sep)"
+            bind:value={presetArgsRaw[idx]}
+            data-testid={`settings-pane-preset-args-${idx}`}
+          />
+          <input
+            type="text"
+            placeholder="cwd"
+            value={preset.cwd ?? ""}
+            oninput={(e) => {
+              const v = (e.currentTarget as HTMLInputElement).value;
+              preset.cwd = v.trim() === "" ? null : v;
+            }}
+            data-testid={`settings-pane-preset-cwd-${idx}`}
+          />
+          <button
+            type="button"
+            class="settings-preset-remove"
+            onclick={() => removePreset(idx)}
+            data-testid={`settings-pane-preset-remove-${idx}`}
+            aria-label="Remove preset"
+          >
+            ×
+          </button>
+        </div>
+      {/each}
+      <button
+        type="button"
+        class="settings-preset-add"
+        onclick={addPreset}
+        data-testid="settings-pane-preset-add"
+      >
+        + Add preset
+      </button>
     </section>
 
     <section class="settings-section" data-testid="settings-theme">

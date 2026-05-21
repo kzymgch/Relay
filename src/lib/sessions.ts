@@ -93,11 +93,61 @@ export async function readAutosave(): Promise<SessionData | null> {
   return raw ?? null;
 }
 
+export async function writeSessionScrollback(
+  name: string,
+  paneId: string,
+  bytes: Uint8Array,
+  maxBytes: number
+): Promise<void> {
+  await invoke("session_scrollback_write", {
+    name,
+    paneId,
+    bytes: Array.from(bytes),
+    maxBytes,
+  });
+}
+
+export async function readSessionScrollback(name: string, paneId: string): Promise<Uint8Array> {
+  const raw = (await invoke("session_scrollback_read", { name, paneId })) as number[] | undefined;
+  return new Uint8Array(raw ?? []);
+}
+
+export async function writeAutosaveScrollback(
+  paneId: string,
+  bytes: Uint8Array,
+  maxBytes: number
+): Promise<void> {
+  await invoke("session_autosave_scrollback_write", {
+    paneId,
+    bytes: Array.from(bytes),
+    maxBytes,
+  });
+}
+
+export async function readAutosaveScrollback(paneId: string): Promise<Uint8Array> {
+  const raw = (await invoke("session_autosave_scrollback_read", { paneId })) as
+    | number[]
+    | undefined;
+  return new Uint8Array(raw ?? []);
+}
+
+export async function clearAutosaveScrollback(): Promise<void> {
+  await invoke("session_autosave_scrollback_clear");
+}
+
 export interface AutosaveDriver {
   /** Build the current SessionData. Called on visibility-hidden / unload. */
   snapshot(): SessionData;
   /** Whether autosave is currently enabled (config.session.autosaveOnExit). */
   enabled(): boolean;
+  /**
+   * Optional side-channel for scrollback persistence. When `config.scrollback
+   * .persistOnExit` is on, the driver collects each live pane's serialised
+   * buffer and forwards it to the autosave-scrollback writer. The returned
+   * pane ids are recorded in the SessionData so restore can read them back.
+   * Implementations that don't persist scrollback can omit this.
+   */
+  persistScrollback?(): Promise<string[]>;
 }
 
 /**
@@ -116,13 +166,30 @@ export function installAutosave(driver: AutosaveDriver): () => void {
     if (document.visibilityState !== "hidden") return;
     if (!driver.enabled()) return;
     try {
-      await writeAutosave(driver.snapshot());
+      // Scrollback must persist *before* the JSON so the JSON's
+      // `scrollbackKeys` list reflects what's on disk.
+      let scrollbackKeys: string[] = [];
+      if (driver.persistScrollback) {
+        try {
+          scrollbackKeys = await driver.persistScrollback();
+        } catch {
+          /* scrollback dump is best-effort */
+        }
+      }
+      const data = driver.snapshot();
+      data.scrollbackKeys = scrollbackKeys;
+      await writeAutosave(data);
     } catch {
       // Autosave is best-effort — don't crash the foreground hand-off.
     }
   };
   const onUnload = () => {
     if (!driver.enabled()) return;
+    // `beforeunload` doesn't reliably await async work, so we can't dump
+    // the scrollback here — the JSON gets written without an updated
+    // scrollback list. The visibilitychange handler above is the
+    // primary path; this is only a fallback for OS-level shutdowns
+    // where visibilitychange might not fire first.
     void writeAutosave(driver.snapshot()).catch(() => {});
   };
 

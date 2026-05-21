@@ -70,6 +70,9 @@ pub fn run() {
             session::session_autosave_read,
             session::session_scrollback_write,
             session::session_scrollback_read,
+            session::session_autosave_scrollback_write,
+            session::session_autosave_scrollback_read,
+            session::session_autosave_scrollback_clear,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

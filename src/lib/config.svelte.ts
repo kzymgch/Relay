@@ -22,11 +22,13 @@ export function createConfigStore(initial?: RelayConfig): ConfigStore {
   let current: RelayConfig = $state(initial ?? defaultConfig());
 
   async function persist(next: RelayConfig): Promise<void> {
-    current = next;
-    // Best-effort: in tests, mockIPC returns undefined for `config_save`
-    // and that's fine — the reactive copy still reflects the edit. In prod
-    // a real failure (validation) propagates so the caller can show it.
+    // Persist FIRST. If the Rust side rejects the config (validation, IO,
+    // …), the in-memory copy must stay on the last known-good value so
+    // the rest of the app — pane spawn defaults, font-size sync, send
+    // options — never reads a stale-invalid mix. Only swap `current` on
+    // success; the throw propagates so the caller can surface the error.
     await saveConfig(next);
+    current = next;
   }
 
   return {
