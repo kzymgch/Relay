@@ -432,18 +432,28 @@ describe("Page — inter-pane send", () => {
     expect(closeBtn.disabled).toBe(true);
   });
 
-  it("Move buttons in the pane popover reorder siblings in the same split", async () => {
+  it("Move button in the Panes modal reorders siblings in the same split without killing PTYs", async () => {
     // Pane 2 (slot-top-right) sits in the column split alongside Pane 3.
-    // Moving it down should swap their DOM order; PTYs survive (no kill/spawn).
+    // PR-32 routes the per-pane Move buttons through the toolbar modal —
+    // open it, switch to the Pane 2 tab, click Move ↓.
     const { container } = await mountPage();
-    const panes = Array.from(container.querySelectorAll(".pane")) as HTMLElement[];
-    const pane2 = panes[1]!;
-    const gear = pane2.querySelector('button[aria-label="Pane settings"]') as HTMLButtonElement;
-    await fireEvent.click(gear);
-    const moveDown = pane2.querySelector(
-      '[data-testid="pane-settings-move-next"]'
+    const toggle = container.querySelector(
+      '[data-testid="panes-toolbar-toggle"]'
+    ) as HTMLButtonElement | null;
+    expect(toggle).not.toBeNull();
+    await fireEvent.click(toggle!);
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-testid="panes-panel"]')).not.toBeNull();
+    });
+    // Pane 2 sits at the slot-top-right id in the default three-pane
+    // preset; the tab testid reflects the pane id, not its label.
+    await fireEvent.click(
+      container.querySelector('[data-testid="panes-tab-slot-top-right"]') as HTMLElement
+    );
+    const moveDown = container.querySelector(
+      '[data-testid="panes-move-next"]'
     ) as HTMLButtonElement;
-    // Inside a column split → glyph is "Move ↓".
+    // Pane 2's parent is a column split → glyph is "Move ↓".
     expect(moveDown.textContent?.trim()).toBe("Move ↓");
     invocations = [];
     await fireEvent.click(moveDown);
@@ -452,13 +462,11 @@ describe("Page — inter-pane send", () => {
       const labels = Array.from(container.querySelectorAll(".pane .label")).map(
         (n) => (n as HTMLElement).textContent
       );
-      // After reorder, the right column shows Pane 3 on top and Pane 2 on
-      // bottom. DOM order corresponds to `Object.values(store.panes)`
-      // insertion order, which doesn't change — so we check the layout
-      // rect ordering by reading the `.slot` style top values instead.
+      // DOM order corresponds to `Object.values(store.panes)` insertion
+      // order, which doesn't change — the visual reorder is encoded in
+      // the .slot top/left rects rather than the label list.
       expect(labels).toEqual(["Pane 1", "Pane 2", "Pane 3"]);
     });
-    // The store reordered the column's children; no PTY kill / spawn.
     expect(invocations.find((i) => i.cmd === "pty_kill")).toBeUndefined();
     expect(invocations.find((i) => i.cmd === "pty_spawn")).toBeUndefined();
   });
