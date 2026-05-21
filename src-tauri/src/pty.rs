@@ -274,15 +274,101 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn resize_does_not_fail_on_running_child() {
+    async fn delivers_stdin_to_child() {
+        // `sh -c "read line; printf 'got=%s\n' \"$line\""` proves the byte
+        // path: write_all -> master -> slave -> child stdin -> child stdout
+        // -> master -> recv. If take_writer / flush were broken, "got=abc"
+        // would never appear because read would block forever.
         let mut pty = Pty::spawn(PtyConfig {
             command: "/bin/sh".into(),
-            args: vec!["-c".into(), "sleep 0.2".into()],
+            args: vec![
+                "-c".into(),
+                "read line; printf 'got=%s\\n' \"$line\"".into(),
+            ],
             ..Default::default()
         })
         .expect("spawn");
+        pty.write_all(b"abc\n").expect("write_all");
+        let output = drain_until_exit(&mut pty).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("got=abc"),
+            "child did not see stdin payload, got {text:?}"
+        );
+        let status = pty.wait().await.expect("wait");
+        assert!(status.success, "shell exited non-zero: {status:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn applies_initial_size_to_pty() {
+        // `stty size` prints "<rows> <cols>" as observed by the slave.
+        // This catches a cols/rows swap in PtySize construction.
+        let mut pty = Pty::spawn(PtyConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "stty size".into()],
+            cols: 120,
+            rows: 40,
+            ..Default::default()
+        })
+        .expect("spawn");
+        let output = drain_until_exit(&mut pty).await;
+        let text = String::from_utf8_lossy(&output);
+        let has_size = text.lines().any(|l| l.trim() == "40 120");
+        assert!(has_size, "expected '40 120' from stty size, got {text:?}");
+        let status = pty.wait().await.expect("wait");
+        assert!(status.success);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_updates_pty_size() {
+        // The child prints stty size twice with a delay in between. We resize
+        // during the delay and expect the second reading to reflect the new
+        // dimensions.
+        let mut pty = Pty::spawn(PtyConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "stty size; sleep 0.5; stty size".into()],
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        })
+        .expect("spawn");
+
+        // Drain until the first reading lands so the resize is unambiguously
+        // applied between the two stty invocations.
+        let mut buf = Vec::new();
+        let waited = timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = pty.recv().await {
+                buf.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&buf)
+                    .lines()
+                    .any(|l| l.trim() == "24 80")
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "did not observe initial '24 80', got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
         pty.resize(120, 40).expect("resize");
-        pty.resize(80, 24).expect("resize back");
+
+        let drain = timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = pty.recv().await {
+                buf.extend_from_slice(&chunk);
+            }
+        });
+        drain.await.expect("drain timed out");
+
+        let text = String::from_utf8_lossy(&buf);
+        let has_resized = text.lines().any(|l| l.trim() == "40 120");
+        assert!(
+            has_resized,
+            "expected '40 120' after resize, full output: {text:?}"
+        );
         let status = pty.wait().await.expect("wait");
         assert!(status.success);
     }
