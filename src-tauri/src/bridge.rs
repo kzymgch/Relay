@@ -94,6 +94,12 @@ impl EventSink for TauriEventSink {
 // Registry
 // ---------------------------------------------------------------------------
 
+/// Pane registry with per-pane locking.
+///
+/// The outer `Mutex` only guards the map (lookups + insert/remove of `Arc`s).
+/// All real PTY I/O — write, resize, kill — runs under the pane's own inner
+/// `Mutex<Pty>`, so a stuck PTY (e.g. a child that has stopped reading its
+/// stdin) cannot freeze operations on the other panes.
 #[derive(Default)]
 pub struct PtyRegistry {
     inner: Mutex<RegistryInner>,
@@ -102,7 +108,7 @@ pub struct PtyRegistry {
 #[derive(Default)]
 struct RegistryInner {
     next_id: u64,
-    ptys: HashMap<String, Pty>,
+    ptys: HashMap<String, Arc<Mutex<Pty>>>,
 }
 
 impl PtyRegistry {
@@ -121,33 +127,46 @@ impl PtyRegistry {
             .lock()
             .expect("PtyRegistry poisoned")
             .ptys
-            .insert(id.to_string(), pty);
+            .insert(id.to_string(), Arc::new(Mutex::new(pty)));
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
+        self.inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .ptys
+            .get(id)
+            .cloned()
+    }
+
+    fn take(&self, id: &str) -> Option<Arc<Mutex<Pty>>> {
+        self.inner
+            .lock()
+            .expect("PtyRegistry poisoned")
+            .ptys
+            .remove(id)
+    }
+
+    fn unknown_id(id: &str) -> PtyError {
+        PtyError::Pty(format!("unknown pty id: {id}"))
     }
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), PtyError> {
-        let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
-        let pty = guard
-            .ptys
-            .get_mut(id)
-            .ok_or_else(|| PtyError::Pty(format!("unknown pty id: {id}")))?;
+        let pty = self.get(id).ok_or_else(|| Self::unknown_id(id))?;
+        let mut pty = pty.lock().expect("Pty mutex poisoned");
         pty.write_all(data)
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), PtyError> {
-        let guard = self.inner.lock().expect("PtyRegistry poisoned");
-        let pty = guard
-            .ptys
-            .get(id)
-            .ok_or_else(|| PtyError::Pty(format!("unknown pty id: {id}")))?;
+        let pty = self.get(id).ok_or_else(|| Self::unknown_id(id))?;
+        let pty = pty.lock().expect("Pty mutex poisoned");
         pty.resize(cols, rows)
     }
 
     pub fn kill(&self, id: &str) -> Result<(), PtyError> {
-        let mut guard = self.inner.lock().expect("PtyRegistry poisoned");
-        if let Some(mut pty) = guard.ptys.remove(id) {
-            pty.kill()?;
-        }
-        Ok(())
+        let pty = self.take(id).ok_or_else(|| Self::unknown_id(id))?;
+        let mut pty = pty.lock().expect("Pty mutex poisoned");
+        pty.kill()
     }
 }
 
@@ -229,15 +248,14 @@ pub async fn spawn_pty(
 
     tokio::spawn(async move {
         forward_loop(sink_for_task.as_ref(), &id_for_task, output_rx).await;
-        if let Ok(status) = exit_rx.await {
+        let exit = exit_rx.await.ok();
+        // Drop the registry entry BEFORE emitting `pty:exit` so any observer
+        // that reacts to the event can rely on the invariant that the pane
+        // is gone from the registry.
+        let _ = registry_for_task.take(&id_for_task);
+        if let Some(status) = exit {
             sink_for_task.emit_exit(&id_for_task, status);
         }
-        // Drop the registry entry once the child is gone so panes don't leak.
-        let mut guard = registry_for_task
-            .inner
-            .lock()
-            .expect("PtyRegistry poisoned");
-        guard.ptys.remove(&id_for_task);
     });
 
     Ok(id)
@@ -519,6 +537,99 @@ mod tests {
         assert_eq!(
             data_events[1], b"tail",
             "second emit should be the coalesced tail"
+        );
+    }
+
+    // The std::sync::MutexGuard for pane A is intentionally held across an
+    // `.await`. The awaited futures only poll a JoinHandle whose underlying
+    // work runs on tokio's blocking thread pool, so this cannot deadlock the
+    // runtime — clippy's heuristic doesn't have that context.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_pane_lock_isolates_blocking_io() {
+        // Hold pane A's inner Mutex<Pty> — equivalent to A being stuck in a
+        // long-running write_all/flush. We then assert two properties:
+        //
+        //   1. A blocking write on the same pane really does stall while the
+        //      lock is held (sanity check that the simulation works).
+        //   2. Operations on a different pane (kill B) complete quickly,
+        //      proving the registry's outer lock is not held during inner
+        //      pane I/O.
+        let registry = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+
+        let a = spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            PtyConfig {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 5".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn A");
+
+        let b = spawn_pty(
+            registry.clone(),
+            sink.clone(),
+            PtyConfig {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 5".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn B");
+
+        let pty_a = registry.get(&a).expect("pane A in registry");
+        let guard_a = pty_a.lock().expect("lock A");
+
+        // Sanity: write on A is blocked while the inner mutex is held.
+        let registry_for_a = registry.clone();
+        let a_for_blocking = a.clone();
+        let mut blocked_write =
+            tokio::task::spawn_blocking(move || registry_for_a.write(&a_for_blocking, b"hi"));
+        let stalled = tokio::time::timeout(Duration::from_millis(200), &mut blocked_write).await;
+        assert!(
+            stalled.is_err(),
+            "write on a locked pane should block, but it returned {stalled:?}"
+        );
+
+        // The actual invariant: kill on a different pane must not be blocked
+        // behind A's lock.
+        let start = Instant::now();
+        registry
+            .kill(&b)
+            .expect("kill B should not be blocked by A");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "kill on pane B took {elapsed:?} while pane A's lock was held"
+        );
+
+        // Releasing A's lock lets the previously-blocked write finish.
+        drop(guard_a);
+        let _ = tokio::time::timeout(Duration::from_secs(2), blocked_write)
+            .await
+            .expect("blocked write should resume once A's lock is released");
+
+        let _ = registry.kill(&a);
+    }
+
+    #[test]
+    fn kill_on_unknown_id_returns_error() {
+        // Kill should match the API surface of write / resize: an unknown
+        // pane id is an error, not a silent no-op. That gives the frontend
+        // a way to detect stale ids and double-kills.
+        let registry = PtyRegistry::new();
+        let err = registry
+            .kill("pane-does-not-exist")
+            .expect_err("expected error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown pty id"),
+            "expected 'unknown pty id' in error, got {msg:?}"
         );
     }
 }
