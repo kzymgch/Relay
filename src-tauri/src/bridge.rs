@@ -632,4 +632,71 @@ mod tests {
             "expected 'unknown pty id' in error, got {msg:?}"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn three_panes_run_simultaneously() {
+        // PR-07 mounts three panes at startup. Verify the bridge can host
+        // three concurrent spawns: distinct ids, each child gets its own
+        // output stream, and all complete successfully.
+        let registry = Arc::new(PtyRegistry::new());
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::default());
+
+        let (id1, id2, id3) = tokio::join!(
+            spawn_pty(
+                registry.clone(),
+                sink.clone(),
+                PtyConfig {
+                    command: "/bin/echo".into(),
+                    args: vec!["pane1".into()],
+                    ..Default::default()
+                },
+            ),
+            spawn_pty(
+                registry.clone(),
+                sink.clone(),
+                PtyConfig {
+                    command: "/bin/echo".into(),
+                    args: vec!["pane2".into()],
+                    ..Default::default()
+                },
+            ),
+            spawn_pty(
+                registry.clone(),
+                sink.clone(),
+                PtyConfig {
+                    command: "/bin/echo".into(),
+                    args: vec!["pane3".into()],
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let id1 = id1.expect("spawn pane1");
+        let id2 = id2.expect("spawn pane2");
+        let id3 = id3.expect("spawn pane3");
+
+        // IDs must be unique so the frontend can route data/exit events.
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+
+        for id in [&id1, &id2, &id3] {
+            let status = wait_for_exit(&sink, id, Duration::from_secs(5)).await;
+            assert!(status.success, "{id} should exit 0, got {status:?}");
+        }
+
+        let text1 = String::from_utf8_lossy(&sink.data_payload_for(&id1)).into_owned();
+        let text2 = String::from_utf8_lossy(&sink.data_payload_for(&id2)).into_owned();
+        let text3 = String::from_utf8_lossy(&sink.data_payload_for(&id3)).into_owned();
+
+        assert!(text1.contains("pane1"), "{id1} output: {text1:?}");
+        assert!(text2.contains("pane2"), "{id2} output: {text2:?}");
+        assert!(text3.contains("pane3"), "{id3} output: {text3:?}");
+
+        // Output must not leak across panes.
+        assert!(!text1.contains("pane2"));
+        assert!(!text1.contains("pane3"));
+        assert!(!text2.contains("pane1"));
+        assert!(!text3.contains("pane1"));
+    }
 }

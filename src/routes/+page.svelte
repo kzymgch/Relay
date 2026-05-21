@@ -1,24 +1,39 @@
 <script lang="ts">
-  import Terminal from "$lib/Terminal.svelte";
-  import type { TerminalApi } from "$lib/terminal";
+  import Pane from "$lib/Pane.svelte";
 
-  let api: TerminalApi | undefined = $state();
+  type PaneSlotId = "left" | "topRight" | "bottomRight";
 
-  function handleReady(a: TerminalApi) {
-    api = a;
-    a.write("Relay — terminal component ready.\r\n");
-    a.write("PTY wiring lands in the next PR; keystrokes echo locally for now.\r\n\r\n");
-    a.focus();
+  interface PaneSpec {
+    id: PaneSlotId;
+    label: string;
+    command: string;
+    args?: string[];
   }
 
-  function handleData(d: string) {
-    // Local echo placeholder until PR-07 wires this into the PTY bridge.
-    api?.write(d);
-  }
+  // PR-07 spawns the user's login shell in every slot. PR-12 will let the
+  // user configure each pane's command / cwd / env, and PR-14 will load the
+  // defaults from `config.toml`.
+  const panes: PaneSpec[] = [
+    { id: "left", label: "Pane 1", command: "/bin/zsh", args: ["-l"] },
+    { id: "topRight", label: "Pane 2", command: "/bin/zsh", args: ["-l"] },
+    { id: "bottomRight", label: "Pane 3", command: "/bin/zsh", args: ["-l"] },
+  ];
+
+  let focusedId: PaneSlotId = $state("left");
 </script>
 
-<div class="app">
-  <Terminal onready={handleReady} ondata={handleData} />
+<div class="layout">
+  {#each panes as pane (pane.id)}
+    <div class="slot" style="grid-area: {pane.id};">
+      <Pane
+        label={pane.label}
+        command={pane.command}
+        args={pane.args}
+        focused={focusedId === pane.id}
+        onfocus={() => (focusedId = pane.id)}
+      />
+    </div>
+  {/each}
 </div>
 
 <style>
@@ -26,12 +41,27 @@
     margin: 0;
     padding: 0;
     height: 100vh;
-    background: #1e1e1e;
+    width: 100vw;
+    background: #000;
     color: #f6f6f6;
+    overflow: hidden;
   }
 
-  .app {
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    grid-template-areas:
+      "left topRight"
+      "left bottomRight";
     height: 100vh;
     width: 100vw;
+    gap: 2px;
+    background: #000;
+  }
+
+  .slot {
+    min-width: 0;
+    min-height: 0;
   }
 </style>
