@@ -98,6 +98,27 @@ impl Pty {
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
         }
+
+        // The macOS bundle launched from Finder runs under `launchd` with a
+        // near-empty environment, so the child PTY would otherwise miss
+        // TERM entirely — ncurses tools like `clear` fail with "TERM
+        // environment variable not set." and zsh's line editor falls back
+        // to dumb mode where Backspace echoes a literal character instead
+        // of erasing one. Set a terminal-friendly baseline first, inherit
+        // a handful of well-known vars from the parent so .zshrc has
+        // enough context, then let the user's pane config override either.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        for key in [
+            "HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+
+        // User-provided env wins — applied last so it can replace any
+        // of the baseline / inherited values above.
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
@@ -273,6 +294,56 @@ mod tests {
         let status = pty.wait().await.expect("wait");
         assert!(status.success, "echo should exit 0, got {status:?}");
         assert_eq!(status.code, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injects_baseline_terminal_env() {
+        // Regression: under a Finder-launched .app the parent env is
+        // near-empty, so the child PTY would otherwise miss TERM —
+        // `clear` exits with "TERM environment variable not set." and
+        // zsh's line editor falls back to dumb mode where Backspace
+        // stops erasing. Pty::spawn must set TERM (and COLORTERM)
+        // regardless of what the parent process provides.
+        let mut pty = Pty::spawn(PtyConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf 'TERM=%s\\nCOLORTERM=%s\\n' \"$TERM\" \"$COLORTERM\"".into(),
+            ],
+            ..Default::default()
+        })
+        .expect("spawn");
+        let output = drain_until_exit(&mut pty).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("TERM=xterm-256color"),
+            "expected baseline TERM=xterm-256color, got {text:?}"
+        );
+        assert!(
+            text.contains("COLORTERM=truecolor"),
+            "expected baseline COLORTERM=truecolor, got {text:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_env_overrides_baseline() {
+        // The user's pane config (or session restore) can set a custom
+        // TERM and Pty::spawn must apply that on top of the baseline.
+        let mut env = std::collections::HashMap::new();
+        env.insert("TERM".into(), "screen-256color".into());
+        let mut pty = Pty::spawn(PtyConfig {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'TERM=%s\\n' \"$TERM\"".into()],
+            env,
+            ..Default::default()
+        })
+        .expect("spawn");
+        let output = drain_until_exit(&mut pty).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("TERM=screen-256color"),
+            "user override should win, got {text:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
