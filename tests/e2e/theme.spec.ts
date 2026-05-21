@@ -1,14 +1,15 @@
 import { test, expect } from "@playwright/test";
 
 import { installMockIpc, recordedCalls } from "./support/mock-ipc";
+import { pressShortcut, waitForLayout } from "./support/helpers";
 
 test.describe("theme", () => {
   test("switching the preset updates --relay-app-bg in <html>", async ({ page }) => {
     await installMockIpc(page);
     await page.goto("/");
+    await waitForLayout(page);
 
-    // Cmd+, opens settings (macOS Cmd is Meta in Playwright).
-    await page.keyboard.press("Meta+Comma");
+    await pressShortcut(page, { code: "Comma", metaKey: true });
     await expect(page.getByTestId("settings-panel")).toBeVisible();
 
     // The default is dark; solarized-dark has a distinctly green-leaning bg.
@@ -30,7 +31,9 @@ test.describe("theme", () => {
   test("transparency toggle invokes set_window_vibrancy", async ({ page }) => {
     await installMockIpc(page);
     await page.goto("/");
-    await page.keyboard.press("Meta+Comma");
+    await waitForLayout(page);
+
+    await pressShortcut(page, { code: "Comma", metaKey: true });
     await page.getByTestId("settings-theme-transparent").check();
     await page.getByTestId("settings-save").click();
 

@@ -1,13 +1,15 @@
 import { test, expect } from "@playwright/test";
 
 import { installMockIpc } from "./support/mock-ipc";
+import { pressShortcut, waitForLayout } from "./support/helpers";
 
 test.describe("keybind", () => {
   test("default cmd+p opens the command palette", async ({ page }) => {
     await installMockIpc(page);
     await page.goto("/");
+    await waitForLayout(page);
 
-    await page.keyboard.press("Meta+P");
+    await pressShortcut(page, { code: "KeyP", metaKey: true });
     await expect(page.getByTestId("command-palette")).toBeVisible();
   });
 
@@ -34,13 +36,14 @@ test.describe("keybind", () => {
       },
     });
     await page.goto("/");
+    await waitForLayout(page);
 
     // Old combo no longer opens the palette.
-    await page.keyboard.press("Meta+P");
+    await pressShortcut(page, { code: "KeyP", metaKey: true });
     await expect(page.getByTestId("command-palette")).toBeHidden();
 
     // New combo does.
-    await page.keyboard.press("Meta+Shift+KeyP");
+    await pressShortcut(page, { code: "KeyP", metaKey: true, shiftKey: true });
     await expect(page.getByTestId("command-palette")).toBeVisible();
   });
 
@@ -61,14 +64,18 @@ test.describe("keybind", () => {
           dailyRotation: true,
           secrets: [],
         },
-        // palette.open and settings.open both bound to cmd+p.
-        keybind: { "palette.open": "cmd+p", "settings.open": "cmd+p" },
+        // Conflict on a pane action, not on settings.open — otherwise
+        // remapping settings.open would make Cmd+, fail to open the panel
+        // and the banner would be inside a modal we can't reach.
+        keybind: { "pane.clear": "cmd+x", "pane.restart": "cmd+x" },
         defaultPane: { label: "Pane", command: "/bin/zsh", args: ["-l"], cwd: null, env: {} },
         pane: { preset: [] },
       },
     });
     await page.goto("/");
-    await page.keyboard.press("Meta+Comma");
+    await waitForLayout(page);
+    await pressShortcut(page, { code: "Comma", metaKey: true });
+    await expect(page.getByTestId("settings-panel")).toBeVisible();
     await expect(page.getByTestId("settings-keybind-conflicts")).toBeVisible();
   });
 });
