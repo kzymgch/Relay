@@ -565,6 +565,7 @@
   class="pane"
   class:focused
   class:drop-active={dropActive}
+  data-pane-id={paneId}
   onclick={handleFocusRequest}
   oncontextmenu={handleContextMenu}
   ondragenter={handleDragEnter}

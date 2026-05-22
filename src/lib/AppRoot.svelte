@@ -16,6 +16,8 @@
   import SendPreviewModal from "./send/SendPreviewModal.svelte";
   import PanesPanel, { type PaneRow } from "./panes/PanesPanel.svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
+  import { sendPtyText } from "./pty";
   import {
     applySessionRules,
     clearAutosaveScrollback,
@@ -800,6 +802,100 @@
     }
   }
 
+  // --- External file drag-and-drop ---
+
+  let externalDropHoverEl: HTMLElement | null = null;
+
+  function setExternalDropHover(el: HTMLElement | null): void {
+    if (el === externalDropHoverEl) return;
+    externalDropHoverEl?.classList.remove("drop-active");
+    externalDropHoverEl = el;
+    externalDropHoverEl?.classList.add("drop-active");
+  }
+
+  function clearExternalDropHover(): void {
+    setExternalDropHover(null);
+  }
+
+  /** POSIX-safe single-quote wrap. Escapes any embedded single-quote by
+   *  closing, inserting a literal escaped quote, and reopening. Safe to
+   *  paste into bash/zsh/sh as a single token. */
+  function shellQuote(s: string): string {
+    return `'${s.replace(/'/g, `'\\''`)}'`;
+  }
+
+  /** True while any Modal (settings, pipe rules, palette, send preview…)
+   *  is showing. We detect this via the DOM rather than enumerating every
+   *  modal state because the Modal component centralises that contract —
+   *  this stays correct even when future modals are added. */
+  function isModalOpen(): boolean {
+    return document.querySelector(".modal-backdrop") !== null;
+  }
+
+  function paneAtPoint(physicalX: number, physicalY: number): HTMLElement | null {
+    const dpr = window.devicePixelRatio || 1;
+    const cssX = physicalX / dpr;
+    const cssY = physicalY / dpr;
+    const hit = document.elementFromPoint(cssX, cssY);
+    if (!(hit instanceof HTMLElement)) return null;
+    // Match the `.pane` wrapper specifically. SelectionChip also stamps a
+    // `data-pane-id` on itself (so its internal drag payload carries the
+    // pane id), so a plain `[data-pane-id]` selector would land on the
+    // chip when the cursor hovers it — the resolved id would still be
+    // correct, but the drop-active highlight would attach to the small
+    // chip overlay instead of the pane wrapper, leaving most of the pane
+    // un-highlighted.
+    const pane = hit.closest(".pane[data-pane-id]");
+    return pane instanceof HTMLElement ? pane : null;
+  }
+
+  async function handleExternalDrop(payload: DragDropEvent): Promise<void> {
+    if (payload.type === "leave") {
+      clearExternalDropHover();
+      return;
+    }
+    // While a modal is open its full-window backdrop covers every pane,
+    // so a drop on what the user sees as "the dialog" would otherwise
+    // fall through to the terminal underneath (or — worse — to the
+    // focused pane via the fallback below) and silently paste a path the
+    // user never targeted. Suppress drag-drop entirely in that mode.
+    if (isModalOpen()) {
+      clearExternalDropHover();
+      return;
+    }
+    if (payload.type === "enter" || payload.type === "over") {
+      const el = paneAtPoint(payload.position.x, payload.position.y);
+      setExternalDropHover(el);
+      return;
+    }
+    // drop
+    clearExternalDropHover();
+    if (!payload.paths || payload.paths.length === 0) return;
+    const pane = paneAtPoint(payload.position.x, payload.position.y);
+    // Resolve the target pane: explicit drop location wins; otherwise fall
+    // back to the focused pane so a drop on the toolbar / status bar /
+    // splitter still ends up somewhere reasonable. (Modal-open case is
+    // handled above so the fallback can't surprise the user.)
+    const targetId = pane?.dataset.paneId ?? store.focusedPaneId;
+    if (!targetId) return;
+    const targetHandle = handles[targetId];
+    if (!targetHandle) return;
+    const targetPtyId = targetHandle.getPtyId();
+    if (!targetPtyId) return;
+    // Focus the target so the user can immediately keep typing into the
+    // line that now contains the path(s).
+    if (store.focusedPaneId !== targetId) store.focus(targetId);
+    const text = payload.paths.map(shellQuote).join(" ");
+    try {
+      // Bracketed paste so the shell treats the (possibly multi-byte)
+      // path as a single literal token; no trailing newline so the user
+      // can edit / extend the line before pressing Enter.
+      await sendPtyText(targetPtyId, text, true, false);
+    } catch (e) {
+      console.error("[app] file drop send failed", e);
+    }
+  }
+
   onMount(() => {
     window.addEventListener("keydown", handleKeydown);
 
@@ -808,7 +904,33 @@
     // synchronous defaults instead of breaking the mount.
     let unsubConfig: (() => void) | undefined;
     let unsubConfigEvent: (() => void) | undefined;
+    let unsubFileDrop: (() => void) | undefined;
     let teardownAutosave: (() => void) | undefined;
+
+    // External file drag-and-drop. Tauri 2 windows default to
+    // `dragDropEnabled: true`, which intercepts native file drops at the
+    // OS layer — so the per-pane DOM `ondrop` (which only accepts the
+    // relay-internal `application/x-relay-send` MIME) never sees them.
+    // We subscribe at the webview level and route the path(s) into the
+    // pane the cursor is over, shell-quoted and bracketed-pasted so the
+    // shell treats them as a single literal token the user can edit.
+    //
+    // Position from Tauri is in physical pixels; `elementFromPoint` wants
+    // CSS pixels, so we divide by devicePixelRatio.
+    try {
+      void getCurrentWebview()
+        .onDragDropEvent((event) => {
+          void handleExternalDrop(event.payload);
+        })
+        .then((un) => {
+          unsubFileDrop = un;
+        })
+        .catch(() => {
+          /* tests / non-Tauri host: no webview-level events */
+        });
+    } catch {
+      /* getCurrentWebview throws if invoked outside a Tauri webview */
+    }
 
     void (async () => {
       try {
@@ -870,6 +992,8 @@
       window.removeEventListener("keydown", handleKeydown);
       unsubConfig?.();
       unsubConfigEvent?.();
+      unsubFileDrop?.();
+      clearExternalDropHover();
       teardownAutosave?.();
       // Intentionally NO autosave write here — unmount also fires during
       // HMR / test cleanup, both of which would overwrite a legitimate
