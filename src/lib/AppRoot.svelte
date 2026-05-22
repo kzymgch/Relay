@@ -32,6 +32,7 @@
     readSessionScrollback,
     saveSession as saveSessionRust,
     serializeSession,
+    writeAutosave,
     writeAutosaveScrollback,
     writeSessionScrollback,
     type LayoutPayload,
@@ -219,6 +220,26 @@
       pipeRules,
       name
     );
+  }
+
+  /**
+   * Flush the current layout to the autosave file in response to an explicit
+   * user edit (e.g. Save in the Pane Settings modal). The exit-time autosave
+   * driver doesn't reliably fire before the process dies on macOS Cmd+Q, so
+   * relying on it would silently lose the user's change. Scrollback keys are
+   * preserved from the previous autosave so this lightweight write doesn't
+   * orphan the on-disk scrollback files.
+   */
+  async function flushAutosave(): Promise<void> {
+    if (!config.current.session.autosaveOnExit) return;
+    try {
+      const data = snapshotSession();
+      const prev = await readAutosave();
+      if (prev?.scrollbackKeys) data.scrollbackKeys = prev.scrollbackKeys;
+      await writeAutosave(data);
+    } catch {
+      /* best-effort — the in-memory store is the source of truth */
+    }
   }
 
   function applyLayoutPayload(layout: LayoutPayload): void {
@@ -1195,7 +1216,10 @@
     panes={paneRows}
     initialPaneId={store.focusedPaneId}
     canClose={canClose()}
-    onupdatemeta={(paneId, patch) => store.updatePaneMeta(paneId, patch)}
+    onupdatemeta={(paneId, patch) => {
+      store.updatePaneMeta(paneId, patch);
+      void flushAutosave();
+    }}
     onsplit={(paneId, direction, position) => {
       const newId = store.splitPane(paneId, direction, position);
       if (newId) store.focus(newId);
