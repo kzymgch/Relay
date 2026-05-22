@@ -1,16 +1,43 @@
+/* Pipe rules panel — matches settings-panel.css conventions so the modal
+ * stays consistent with the rest of the dark/sans UI shell. Without an
+ * explicit font here `<h2>`, `<table>`, and form inputs fall through to UA
+ * defaults (Times on macOS WKWebView for headings, white form chrome) and
+ * the whole dialog reads like a printed page. */
+
 .pipe-rules-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 12px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--relay-toolbar-border);
 }
 
+.pipe-rules-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--relay-modal-fg);
+}
+
+.pipe-rules-header button {
+  background: var(--relay-pane-bg);
+  color: inherit;
+  border: 1px solid var(--relay-toolbar-border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.pipe-rules-header button:hover {
+  background: var(--relay-palette-highlight);
+}
+
 .pipe-rules-body {
-  padding: 12px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
   overflow: auto;
 }
 
@@ -31,14 +58,42 @@
 .pipe-rules-table th {
   color: var(--relay-status-exited);
   font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+}
+
+.pipe-rules-table td.danger {
+  white-space: nowrap;
+}
+
+.pipe-rules-table td button {
+  background: var(--relay-pane-bg);
+  color: inherit;
+  border: 1px solid var(--relay-toolbar-border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font: inherit;
+  cursor: pointer;
+  margin-right: 4px;
+}
+
+.pipe-rules-table td button:hover {
+  background: var(--relay-palette-highlight);
+}
+
+.pipe-rules-table td.danger button[data-testid^="pipe-rule-delete"] {
+  color: var(--relay-status-error);
+  border-color: rgba(248, 113, 113, 0.4);
 }
 
 .pipe-rules-form {
   display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 6px 10px;
-  border-top: 1px dashed var(--relay-toolbar-border);
-  padding-top: 10px;
+  grid-template-columns: 130px 1fr;
+  gap: 8px 12px;
+  border: 1px solid var(--relay-toolbar-border);
+  border-radius: 6px;
+  padding: 10px 12px;
 }
 
 .pipe-rules-form label {
@@ -46,18 +101,71 @@
   color: var(--relay-toolbar-fg);
 }
 
-.pipe-rules-form input,
+.pipe-rules-form input[type="text"],
+.pipe-rules-form input[type="number"],
 .pipe-rules-form select {
   width: 100%;
   box-sizing: border-box;
+  background: var(--relay-pane-bg);
+  color: inherit;
+  border: 1px solid var(--relay-toolbar-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+}
+
+.pipe-rules-form input[type="text"]:focus,
+.pipe-rules-form input[type="number"]:focus,
+.pipe-rules-form select:focus {
+  outline: 1px solid var(--relay-pane-border-focused);
+  outline-offset: -1px;
+  border-color: var(--relay-pane-border-focused);
+}
+
+.pipe-rules-form input[type="checkbox"],
+.pipe-rules-table input[type="checkbox"] {
+  justify-self: start;
+  /* accent-color paints the native checkbox without breaking accessibility,
+   * so we keep keyboard nav / a11y semantics while matching the focused
+   * pane-border blue used elsewhere in the chrome. */
+  accent-color: var(--relay-pane-border-focused);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
 }
 
 .pipe-rules-actions {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
-  padding: 8px 12px;
+  padding: 10px 16px;
   border-top: 1px solid var(--relay-toolbar-border);
+  background: var(--relay-toolbar-bg);
+}
+
+.pipe-rules-actions button {
+  background: var(--relay-pane-bg);
+  color: inherit;
+  border: 1px solid var(--relay-toolbar-border);
+  border-radius: 4px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.pipe-rules-actions button:hover {
+  background: var(--relay-palette-highlight);
+}
+
+.pipe-rules-actions button.primary {
+  background: var(--relay-pane-border-focused);
+  border-color: var(--relay-pane-border-focused);
+  color: #ffffff;
+}
+
+.pipe-rules-actions button.primary:hover {
+  filter: brightness(1.1);
+  background: var(--relay-pane-border-focused);
 }
 
 .pipe-rules-toast {
@@ -71,10 +179,6 @@
 
 .pipe-rules-empty {
   color: var(--relay-status-exited);
-  font-style: italic;
   padding: 12px 4px;
-}
-
-.pipe-rules-table td.danger button {
-  color: var(--relay-status-error);
+  font-size: 12px;
 }

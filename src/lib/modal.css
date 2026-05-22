@@ -19,4 +19,14 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Without this baseline, WKWebView falls back to Times for <h2>/<h3> and
+   * white system chrome for form controls, which makes any new modal read
+   * like a printed page next to the terminal UI. Per-panel CSS can still
+   * override these, but the default now matches the rest of the chrome. */
+  font:
+    13px/1.4 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
 }
