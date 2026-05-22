@@ -16,7 +16,9 @@
   import SendPreviewModal from "./send/SendPreviewModal.svelte";
   import PanesPanel, { type PaneRow } from "./panes/PanesPanel.svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
+  import { extractLastUrl } from "./urls";
   import { sendPtyText } from "./pty";
   import {
     applySessionRules,
@@ -772,6 +774,26 @@
       },
       "pane.search": () => {
         focused?.openSearch();
+        return true;
+      },
+      "pane.open-url": () => {
+        // Selection wins so the user can target a non-most-recent URL by
+        // dragging across it; otherwise we scan backwards through the
+        // buffer for the latest printed URL (the `Local: http://…` line
+        // from `pnpm tauri dev`, a `gh pr create` confirmation, etc.).
+        // Both paths go through the same `extractLastUrl` so the trim /
+        // balanced-bracket rules behave identically regardless of whether
+        // the user selected the URL or not.
+        const selection = focused?.getSelection();
+        const url = (selection && extractLastUrl(selection)) || focused?.findLastUrl();
+        if (!url) {
+          // No URL anywhere — let the keystroke fall through so the shell
+          // can do whatever it wants with cmd+enter (most shells: nothing).
+          return false;
+        }
+        openUrl(url).catch((e: unknown) => {
+          console.error("[app] open-url failed", e);
+        });
         return true;
       },
     };

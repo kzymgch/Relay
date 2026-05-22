@@ -20,7 +20,8 @@ export type KeybindActionId =
   | "settings.open"
   | "pane.clear"
   | "pane.restart"
-  | "pane.search";
+  | "pane.search"
+  | "pane.open-url";
 
 export interface KeybindActionDef {
   id: KeybindActionId;
@@ -66,6 +67,11 @@ export const KEYBIND_ACTIONS: readonly KeybindActionDef[] = [
   { id: "pane.clear", label: "Clear focused pane (Cmd+K)", defaultCombo: "cmd+k" },
   { id: "pane.restart", label: "Restart focused pane (Cmd+R)", defaultCombo: "cmd+r" },
   { id: "pane.search", label: "Search in focused pane (Cmd+F)", defaultCombo: "cmd+f" },
+  {
+    id: "pane.open-url",
+    label: "Open last URL in browser (Cmd+Enter)",
+    defaultCombo: "cmd+enter",
+  },
 ];
 
 /** Quick lookup by id. */

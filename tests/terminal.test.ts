@@ -97,8 +97,99 @@ describe("Terminal component", () => {
     expect(typeof api.serialize).toBe("function");
     expect(typeof api.findNext).toBe("function");
     expect(typeof api.findPrevious).toBe("function");
+    expect(typeof api.findLastUrl).toBe("function");
     expect(typeof api.cols).toBe("number");
     expect(typeof api.rows).toBe("number");
+  });
+
+  it("findLastUrl returns the most recent http(s) URL in the buffer", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    term.bufferLines = [
+      "  VITE v5.4.0  ready in 312 ms",
+      "",
+      "  ➜  Local:   http://localhost:1420/",
+      "  ➜  Network: use --host to expose",
+      "$ ",
+    ];
+    expect(api.findLastUrl()).toBe("http://localhost:1420/");
+  });
+
+  it("findLastUrl strips trailing sentence punctuation", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    // Common shell output: "see https://example.com/foo." — the trailing
+    // period is rarely meant as part of the URL.
+    term.bufferLines = ["see https://example.com/foo."];
+    expect(api.findLastUrl()).toBe("https://example.com/foo");
+  });
+
+  it("findLastUrl preserves balanced trailing parens (Wikipedia-style URL)", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    // The `)` is part of the URL because its `(` opens earlier in the URL.
+    term.bufferLines = ["see https://en.wikipedia.org/wiki/Function_(mathematics)"];
+    expect(api.findLastUrl()).toBe("https://en.wikipedia.org/wiki/Function_(mathematics)");
+  });
+
+  it("findLastUrl preserves IPv6 bracketed host", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    term.bufferLines = ["serving on http://[::1]:8080/admin"];
+    expect(api.findLastUrl()).toBe("http://[::1]:8080/admin");
+  });
+
+  it("findLastUrl strips an UNbalanced wrapping paren", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    // The `)` has no matching `(` inside the URL — it's the sentence's
+    // closing paren, not part of the URL.
+    term.bufferLines = ["(see https://example.com/path)"];
+    expect(api.findLastUrl()).toBe("https://example.com/path");
+  });
+
+  it("findLastUrl reassembles a URL that soft-wrapped across two rows", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    // xterm marks the *continuation* row with isWrapped=true; the row
+    // that wraps out of view has isWrapped=false (it's the start of the
+    // logical line).
+    term.bufferLines = [
+      "$ gh pr view --web",
+      "Opening https://github.com/anthropics/claude-code/pull/12345/files/very-long",
+      { text: "-segment-name/and-more?diff=split#commit-abcdef1234567890", isWrapped: true },
+    ];
+    expect(api.findLastUrl()).toBe(
+      "https://github.com/anthropics/claude-code/pull/12345/files/very-long-segment-name/and-more?diff=split#commit-abcdef1234567890"
+    );
+  });
+
+  it("findLastUrl reassembles a URL across three soft-wrapped rows", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    term.bufferLines = [
+      "$ echo $URL",
+      "https://example.com/very/deep/path/that-wraps-twice-because-its-quite-long",
+      { text: "/segment-two-continues-here-still-the-same-url/segment-three", isWrapped: true },
+      { text: "/segment-four-is-the-tail?with=params", isWrapped: true },
+    ];
+    expect(api.findLastUrl()).toBe(
+      "https://example.com/very/deep/path/that-wraps-twice-because-its-quite-long/segment-two-continues-here-still-the-same-url/segment-three/segment-four-is-the-tail?with=params"
+    );
+  });
+
+  it("findLastUrl returns undefined for an empty / URL-less buffer", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    term.bufferLines = ["$ ls", "file1  file2  file3", "$ "];
+    expect(api.findLastUrl()).toBeUndefined();
+  });
+
+  it("findLastUrl picks the LAST URL when multiple appear on one line", async () => {
+    const { api } = await mount();
+    const term = getXtermState().instances.at(-1)!;
+    term.bufferLines = ["pick https://first.example/ over https://second.example/path"];
+    expect(api.findLastUrl()).toBe("https://second.example/path");
   });
 
   it("ondata fires when paste is called", async () => {

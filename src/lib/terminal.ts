@@ -22,6 +22,14 @@ export interface TerminalApi {
    * forcing the user to copy it first.
    */
   getSelection(): string | undefined;
+  /**
+   * Scan the terminal buffer (scrollback + viewport) backwards for the most
+   * recently emitted `http://` or `https://` URL. Returns `undefined` when
+   * the buffer contains no URL. Used by Cmd+Enter to open the URL a CLI just
+   * printed (e.g. the `Local: http://localhost:1420/` line from
+   * `pnpm tauri dev`) without forcing the user to click it.
+   */
+  findLastUrl(): string | undefined;
   readonly cols: number;
   readonly rows: number;
 }
