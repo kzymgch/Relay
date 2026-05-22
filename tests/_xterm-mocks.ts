@@ -9,16 +9,59 @@ import { vi } from "vitest";
 type OnDataCallback = (data: string) => void;
 type OnResizeCallback = (event: { cols: number; rows: number }) => void;
 
+interface MockBufferLine {
+  isWrapped: boolean;
+  translateToString(trim?: boolean): string;
+}
+
+// Tests usually only care about a line's text; for soft-wrap scenarios
+// they upgrade specific entries to `{ text, isWrapped: true }`. Strings
+// default to `isWrapped: false` (a fresh logical line).
+type MockBufferEntry = string | { text: string; isWrapped?: boolean };
+
 class MockTerminal {
   cols = 80;
   rows = 24;
   options: Record<string, unknown>;
   addons: unknown[] = [];
   openedOn: HTMLElement | null = null;
-  buffer = { active: { viewportY: 0 } };
+  // Mutable line list so tests can populate scrollback before exercising
+  // buffer-scanning APIs (e.g. findLastUrl). `getLine(y)` returns undefined
+  // past the end to match xterm's real behaviour.
+  bufferLines: MockBufferEntry[] = [];
+  buffer: {
+    active: {
+      viewportY: number;
+      readonly length: number;
+      getLine(y: number): MockBufferLine | undefined;
+    };
+  };
 
   constructor(options: Record<string, unknown>) {
     this.options = { ...options };
+    // Owner alias intentional: tests reassign `term.bufferLines = [...]`, so
+    // closures captured here must dereference the live field via `owner`
+    // rather than capturing the (then-empty) initial array.
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const owner = this;
+    this.buffer = {
+      active: {
+        viewportY: 0,
+        get length(): number {
+          return owner.bufferLines.length;
+        },
+        getLine(y: number): MockBufferLine | undefined {
+          const entry = owner.bufferLines[y];
+          if (entry === undefined) return undefined;
+          const text = typeof entry === "string" ? entry : entry.text;
+          const isWrapped = typeof entry === "string" ? false : !!entry.isWrapped;
+          return {
+            isWrapped,
+            translateToString: (trim?: boolean) => (trim ? text.replace(/\s+$/, "") : text),
+          };
+        },
+      },
+    };
     state.instances.push(this);
   }
 

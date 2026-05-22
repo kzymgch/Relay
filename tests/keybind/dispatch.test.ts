@@ -21,6 +21,11 @@ describe("keybind/dispatch", () => {
     expect(dispatchKey(key({ code: "KeyP", metaKey: true }), resolved)).toBe("palette.open");
   });
 
+  it("routes default cmd+enter to pane.open-url", () => {
+    const resolved = resolveKeybinds({});
+    expect(dispatchKey(key({ code: "Enter", metaKey: true }), resolved)).toBe("pane.open-url");
+  });
+
   it("routes default cmd+shift+1 to send.to.1", () => {
     const resolved = resolveKeybinds({});
     expect(dispatchKey(key({ code: "Digit1", metaKey: true, shiftKey: true }), resolved)).toBe(

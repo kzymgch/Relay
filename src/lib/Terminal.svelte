@@ -9,6 +9,7 @@
   import "./terminal.css";
 
   import type { TerminalApi, TerminalProps } from "./terminal";
+  import { extractLastUrl } from "./urls";
   import SelectionChip from "./send/SelectionChip.svelte";
 
   let {
@@ -26,6 +27,41 @@
 
   let containerEl: HTMLDivElement | undefined = $state();
   let term: XTerm | undefined = $state();
+
+  // Bound the backwards scan so a 100k-line scrollback doesn't pause the UI
+  // thread on Cmd+Enter — recent URL emission is overwhelmingly within the
+  // last screen or two anyway.
+  const URL_SCAN_MAX_LINES = 1000;
+
+  function findLastUrl(xterm: XTerm): string | undefined {
+    const buf = xterm.buffer.active;
+    const total = buf.length;
+    if (total <= 0) return undefined;
+    const minY = Math.max(0, total - URL_SCAN_MAX_LINES);
+    // Walk backwards one *logical* line at a time. xterm soft-wraps a
+    // long line across multiple physical rows by setting `isWrapped` on
+    // every continuation row; rejoining those rows lets us recover URLs
+    // that exceed the terminal's width (gh PR links, auth callbacks, the
+    // `Local: http://…` line when the column is narrow) without losing
+    // characters at the wrap boundary.
+    let y = total - 1;
+    while (y >= minY) {
+      let startY = y;
+      while (startY > 0) {
+        const line = buf.getLine(startY);
+        if (!line || !line.isWrapped) break;
+        startY--;
+      }
+      let text = "";
+      for (let k = startY; k <= y; k++) {
+        text += buf.getLine(k)?.translateToString(true) ?? "";
+      }
+      const found = text ? extractLastUrl(text) : undefined;
+      if (found) return found;
+      y = startY - 1;
+    }
+    return undefined;
+  }
 
   onMount(() => {
     if (!containerEl) return;
@@ -82,6 +118,7 @@
         const sel = t.getSelection();
         return sel.length > 0 ? sel : undefined;
       },
+      findLastUrl: () => findLastUrl(t),
       get cols() {
         return t.cols;
       },

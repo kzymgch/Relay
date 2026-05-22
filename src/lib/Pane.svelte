@@ -46,6 +46,9 @@
     restart(): void;
     /** Open the in-pane search bar and focus its input (Cmd+F). */
     openSearch(): void;
+    /** Most recent http(s) URL printed to the terminal buffer, or
+     *  `undefined` when none was found. Used by Cmd+Enter. */
+    findLastUrl(): string | undefined;
     /**
      * Serialise the terminal buffer (ANSI sequences included). Used by
      * session save when `config.scrollback.persistOnExit` is on. Returns
@@ -527,6 +530,7 @@
         void restart();
       },
       openSearch,
+      findLastUrl: () => api?.findLastUrl(),
       serialize: () => api?.serialize() ?? "",
       replay: (bytes: Uint8Array) => api?.write(bytes),
     };
